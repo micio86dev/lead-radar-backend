@@ -510,6 +510,37 @@ mod tests {
         assert!(result.mean_confidence().expect("confidence") > 0.5);
     }
 
+    #[test]
+    fn request_body_matches_the_documented_question_shape() {
+        let config = LayaConfig {
+            enabled: true,
+            api_key: Some("test-key".to_string()),
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: None,
+            timeout_seconds: 5,
+        };
+        let provider = JevCompatibleProvider::laya(&config).expect("provider");
+        let request = request();
+        let body = provider.build_body(&request);
+        let value = serde_json::to_value(&body).expect("json");
+
+        let vertical = &value["questions"]["vertical"];
+        assert_eq!(vertical["type"], "choice");
+        let criteria = vertical["criteria"].as_object().expect("criteria object");
+        assert!(
+            criteria.contains_key("hr_recruiting"),
+            "criteria: {criteria:?}"
+        );
+        assert!(
+            !criteria.contains_key("Choice"),
+            "criteria must not be wrapped in a variant name: {criteria:?}"
+        );
+
+        let relevance = &value["questions"]["relevance"];
+        assert_eq!(relevance["type"], "noul");
+        assert!(relevance.get("criteria").is_none(), "noul has no criteria");
+    }
+
     #[tokio::test]
     async fn omits_the_model_when_none_is_configured() {
         let server = MockServer::start().await;

@@ -37,7 +37,11 @@ impl QuestionKind {
 
 /// `choice` criteria are an object (label -> boundary description), `score` criteria are an array
 /// ordered low to high. Swapping them is rejected by the provider, so the type enforces it here.
+/// Serialized transparently: `choice` criteria are the label→description object, `score` criteria are
+/// the tier array. Without `untagged`, serde would wrap them as `{"Choice": {...}}`, which providers
+/// interpret as a single label named "Choice".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum QuestionCriteria {
     Choice(BTreeMap<String, String>),
     Score(Vec<String>),
@@ -496,6 +500,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn criteria_serialize_in_the_documented_wire_shape() {
+        let choice = QuestionCriteria::choice(&[("b", "Second"), ("a", "First")]);
+        assert_eq!(
+            serde_json::to_value(&choice).expect("json"),
+            serde_json::json!({"a": "First", "b": "Second"}),
+            "choice criteria must be the label map, never wrapped in a variant name"
+        );
+
+        let score = QuestionCriteria::score(&["Low", "High"]);
+        assert_eq!(
+            serde_json::to_value(&score).expect("json"),
+            serde_json::json!(["Low", "High"])
+        );
     }
 
     #[test]
