@@ -62,6 +62,7 @@ pub async fn setup_with(decision: &str, generative: &str, source: &str) -> TestA
         ("GENERATIVE_PROVIDER", generative),
         ("SOURCE_PROVIDER", source),
         ("WORKER_POLL_INTERVAL", "1"),
+        ("APIFY_POLL_INTERVAL", "1"),
         ("JOB_RETRY_BACKOFF", "1"),
         ("CORS_ALLOWED_ORIGINS", "http://localhost:4321"),
     ];

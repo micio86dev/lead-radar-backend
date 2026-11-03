@@ -5,69 +5,51 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use validator::Validate;
 
 use crate::auth::TenantContext;
-use crate::domain::time::parse_iso;
 use crate::error::{AppError, AppResult, FieldError};
 use crate::modules::{ingestion, operations};
 use crate::state::SharedState;
 
-const MAX_POSTS_PER_IMPORT: usize = 500;
-const MAX_CONTENT_CHARS: usize = 20_000;
+const MAX_POSTS_PER_IMPORT: u64 = 500;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Validate)]
 pub struct ImportBody {
+    #[validate(length(max = 100))]
     #[serde(default)]
     pub source_name: Option<String>,
+    #[validate(length(min = 1, max = 500), nested)]
     pub posts: Vec<ingestion::ImportPost>,
 }
 
+/// Map validator errors onto the API's field-level error format.
 fn validate(body: &ImportBody) -> AppResult<()> {
-    let mut errors = Vec::new();
-    if body.posts.is_empty() {
-        errors.push(FieldError::new("posts", "at least one post is required"));
-    }
-    if body.posts.len() > MAX_POSTS_PER_IMPORT {
-        errors.push(FieldError::new(
+    body.validate().map_err(|errors| {
+        let mut fields: Vec<FieldError> = errors
+            .field_errors()
+            .iter()
+            .flat_map(|(field, problems)| {
+                problems.iter().map(move |problem| {
+                    let message = problem
+                        .message
+                        .as_ref()
+                        .map(|message| message.to_string())
+                        .unwrap_or_else(|| problem.code.to_string());
+                    FieldError::new(field.to_string(), message)
+                })
+            })
+            .collect();
+        fields.sort_by(|left, right| left.field.cmp(&right.field));
+        AppError::Validation(fields)
+    })?;
+    if body.posts.len() as u64 > MAX_POSTS_PER_IMPORT {
+        return Err(AppError::Validation(vec![FieldError::new(
             "posts",
             format!("at most {MAX_POSTS_PER_IMPORT} posts per import"),
-        ));
+        )]));
     }
-    for (index, post) in body.posts.iter().enumerate() {
-        if post.content.trim().is_empty() {
-            errors.push(FieldError::new(
-                format!("posts[{index}].content"),
-                "must not be empty",
-            ));
-        }
-        if post.content.chars().count() > MAX_CONTENT_CHARS {
-            errors.push(FieldError::new(
-                format!("posts[{index}].content"),
-                format!("must be at most {MAX_CONTENT_CHARS} characters"),
-            ));
-        }
-        if let Some(published_at) = &post.published_at {
-            if parse_iso(published_at).is_none() {
-                errors.push(FieldError::new(
-                    format!("posts[{index}].published_at"),
-                    "must be an RFC 3339 timestamp",
-                ));
-            }
-        }
-        if let Some(engagement) = &post.engagement {
-            if engagement.comments < 0 || engagement.upvotes < 0 || engagement.shares < 0 {
-                errors.push(FieldError::new(
-                    format!("posts[{index}].engagement"),
-                    "counts must not be negative",
-                ));
-            }
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::Validation(errors))
-    }
+    Ok(())
 }
 
 #[utoipa::path(post, path = "/api/v1/import/json", tag = "import", responses((status = 202, description = "Import accepted"), (status = 422, description = "Invalid payload")))]

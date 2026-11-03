@@ -1054,7 +1054,6 @@ dependencies = [
  "axum",
  "chrono",
  "dotenvy",
- "futures",
  "http-body-util",
  "reqwest",
  "serde",

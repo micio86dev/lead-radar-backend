@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use validator::{Validate, ValidationError};
 
 use crate::db::Db;
 use crate::domain::enums::JobKind;
@@ -15,36 +16,57 @@ use crate::domain::time::now_iso;
 use crate::modules::{new_id, operations, to_json};
 
 /// Raw item shape accepted by the manual JSON import and by the generic dataset mapping.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Validation is declared here so every entry point shares the same limits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
 pub struct ImportPost {
+    #[validate(length(max = 200))]
     #[serde(default)]
     pub external_id: Option<String>,
+    #[validate(length(max = 300))]
     #[serde(default)]
     pub title: Option<String>,
+    #[validate(length(min = 1, max = 20000))]
     #[serde(default)]
     pub content: String,
     #[serde(default)]
     pub url: Option<String>,
+    #[validate(length(max = 200))]
     #[serde(default)]
     pub author: Option<String>,
+    #[validate(length(max = 200))]
     #[serde(default)]
     pub community: Option<String>,
+    #[validate(length(max = 16))]
     #[serde(default)]
     pub language: Option<String>,
+    #[validate(custom(function = "validate_optional_timestamp"))]
     #[serde(default)]
     pub published_at: Option<String>,
+    #[validate(nested)]
     #[serde(default)]
     pub engagement: Option<Engagement>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
 pub struct Engagement {
+    #[validate(range(min = 0))]
     #[serde(default)]
     pub comments: i64,
+    #[validate(range(min = 0))]
     #[serde(default)]
     pub upvotes: i64,
+    #[validate(range(min = 0))]
     #[serde(default)]
     pub shares: i64,
+}
+
+/// Timestamps must be RFC 3339 when present; an unparseable value is rejected instead of guessed.
+pub fn validate_optional_timestamp(value: &str) -> Result<(), ValidationError> {
+    if crate::domain::time::parse_iso(value).is_some() {
+        Ok(())
+    } else {
+        Err(ValidationError::new("timestamp").with_message("must be an RFC 3339 timestamp".into()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
