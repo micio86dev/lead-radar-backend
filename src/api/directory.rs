@@ -62,6 +62,63 @@ pub async fn list_communities(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct NewCommunityBody {
+    pub name: String,
+    pub vertical: String,
+    pub notes: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/communities", tag = "communities", responses((status = 201, description = "Community candidate created, pending and disabled"), (status = 409, description = "Community already exists")))]
+pub async fn create_community(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Json(body): Json<NewCommunityBody>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let name = body.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(AppError::Validation(vec![crate::error::FieldError::new(
+            "name",
+            "must be 1..=80 characters",
+        )]));
+    }
+    let vertical = Vertical::parse(&body.vertical).ok_or_else(|| {
+        AppError::Validation(vec![crate::error::FieldError::new(
+            "vertical",
+            "unknown vertical",
+        )])
+    })?;
+    let community = sources::create_community(
+        &state.db,
+        &context.tenant_id,
+        &sources::NewCommunity {
+            name,
+            vertical,
+            notes: body.notes.as_deref(),
+        },
+    )
+    .await
+    .map_err(|error| {
+        if let sqlx::Error::Database(ref db_error) = error {
+            if db_error.is_unique_violation() {
+                return AppError::Conflict("a community with that name already exists".to_string());
+            }
+        }
+        AppError::Database(error)
+    })?;
+    operations::audit(
+        &state.db,
+        &context.tenant_id,
+        &context.actor,
+        "community_created",
+        "community",
+        Some(&community.id),
+        &json!({"name": name, "vertical": vertical.as_str(), "notes": body.notes}),
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(json!(community))))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CommunityPatchBody {
     pub enabled: Option<bool>,
     pub notes: Option<String>,

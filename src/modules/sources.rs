@@ -396,6 +396,39 @@ pub async fn list_communities(
     Ok((rows.into_iter().map(Community::from).collect(), total))
 }
 
+pub struct NewCommunity<'a> {
+    pub name: &'a str,
+    pub vertical: Vertical,
+    pub notes: Option<&'a str>,
+}
+
+/// Create a community candidate. It is always born `pending` and disabled: relevance is a judgement,
+/// permission is not.
+pub async fn create_community(
+    db: &Db,
+    tenant_id: &str,
+    input: &NewCommunity<'_>,
+) -> Result<Community, sqlx::Error> {
+    let id = new_id();
+    let now = now_iso();
+    sqlx::query(
+        "INSERT INTO communities (id, tenant_id, name, vertical, validation_status, enabled, notes, \
+         created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(input.name)
+    .bind(input.vertical.as_str())
+    .bind(input.notes)
+    .bind(&now)
+    .bind(&now)
+    .execute(&db.writer)
+    .await?;
+    get_community(db, tenant_id, &id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)
+}
+
 pub async fn get_community(
     db: &Db,
     tenant_id: &str,

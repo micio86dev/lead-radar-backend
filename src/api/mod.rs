@@ -71,7 +71,10 @@ pub fn router(state: SharedState) -> Router {
                 .delete(profiles::remove),
         )
         // Communities
-        .route("/communities", get(directory::list_communities))
+        .route(
+            "/communities",
+            get(directory::list_communities).post(directory::create_community),
+        )
         .route("/communities/{id}", patch(directory::patch_community))
         .route(
             "/communities/{id}/validate",
@@ -204,6 +207,7 @@ pub async fn build_state(config: crate::config::AppConfig) -> anyhow::Result<Arc
         profiles::patch,
         profiles::remove,
         directory::list_communities,
+        directory::create_community,
         directory::patch_community,
         directory::validate_community,
         directory::list_sources,

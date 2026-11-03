@@ -409,6 +409,39 @@ async fn communities_and_sources_cannot_be_enabled_without_validation() {
 }
 
 #[tokio::test]
+async fn communities_can_be_added_and_are_born_pending() {
+    let app = setup().await;
+    let (status, body) = post(
+        &app,
+        "/api/v1/communities",
+        json!({"name": "CrossLanguageCalls", "vertical": "international_meetings", "notes": "on-topic for live calls across languages"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["validation_status"], "pending");
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["vertical"], "international_meetings");
+
+    // The same name cannot be added twice.
+    let (status, body) = post(
+        &app,
+        "/api/v1/communities",
+        json!({"name": "CrossLanguageCalls", "vertical": "international_meetings"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // An unknown vertical is rejected.
+    let (status, _) = post(
+        &app,
+        "/api/v1/communities",
+        json!({"name": "something", "vertical": "not_a_vertical"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn sources_require_recorded_validation_before_enabling() {
     let app = setup().await;
     let (status, body) = get(&app, "/api/v1/sources").await;
