@@ -409,6 +409,26 @@ async fn communities_and_sources_cannot_be_enabled_without_validation() {
 }
 
 #[tokio::test]
+async fn seeds_activate_scoring_version_two() {
+    let app = setup().await;
+    let active: (i64, String, String) = sqlx::query_as(
+        "SELECT version, weights, thresholds FROM lead_score_versions \
+         WHERE tenant_id = ? AND active = 1",
+    )
+    .bind(app.tenant())
+    .fetch_one(&app.db().reader)
+    .await
+    .expect("active scoring version");
+    assert_eq!(active.0, 2);
+    assert!(active.1.contains("\"product_fit\":25"));
+    assert!(
+        active.2.contains("\"conferences_webinars\":50"),
+        "conference threshold lowered: {}",
+        active.2
+    );
+}
+
+#[tokio::test]
 async fn communities_can_be_added_and_are_born_pending() {
     let app = setup().await;
     let (status, body) = post(

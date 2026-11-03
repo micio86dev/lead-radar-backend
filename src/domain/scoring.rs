@@ -147,6 +147,38 @@ impl Default for ScoringConfig {
 }
 
 impl ScoringConfig {
+    /// Version 2, calibrated on the first real Reddit sample. Rationale (versioned, auditable):
+    ///
+    /// - Product fit decides whether VoxTranslate can help at all, so it carries more weight than
+    ///   buying intent, which a short post rarely proves.
+    /// - Problem relevance and buying intent drop slightly; business potential stays.
+    /// - Conferences and webinars drop from 60 to 50: a real international-conference thread scored 48
+    ///   while describing four interpreters, two booths and 350 headsets — clearly an opportunity.
+    pub fn default_v2() -> Self {
+        Self {
+            version: 2,
+            weights: ScoringWeights {
+                problem_relevance: 20.0,
+                buying_intent: 20.0,
+                business_potential: 20.0,
+                product_fit: 25.0,
+                recency: 10.0,
+                engagement: 5.0,
+            },
+            bands: ScoreBands::default(),
+            thresholds: QualificationThresholds {
+                per_vertical: BTreeMap::from([
+                    (Vertical::HrRecruiting.as_str().to_string(), 65),
+                    (Vertical::InternationalMeetings.as_str().to_string(), 60),
+                    (Vertical::ConferencesWebinars.as_str().to_string(), 50),
+                    (Vertical::CustomerSupport.as_str().to_string(), 65),
+                    (Vertical::TourismHospitality.as_str().to_string(), 65),
+                    (Vertical::Other.as_str().to_string(), 60),
+                ]),
+            },
+        }
+    }
+
     pub fn default_v1() -> Self {
         Self {
             version: 1,
@@ -393,6 +425,46 @@ mod tests {
         assert_eq!(config.threshold_for(Vertical::HrRecruiting), 65);
         assert_eq!(config.threshold_for(Vertical::CustomerSupport), 65);
         assert_eq!(config.threshold_for(Vertical::TourismHospitality), 65);
+    }
+
+    #[test]
+    fn version_two_reweights_product_fit_and_lowers_the_conference_threshold() {
+        let config = ScoringConfig::default_v2();
+        config.validate().expect("valid");
+        assert_eq!(config.version, 2);
+        assert_eq!(config.weights.problem_relevance, 20.0);
+        assert_eq!(config.weights.buying_intent, 20.0);
+        assert_eq!(config.weights.business_potential, 20.0);
+        assert_eq!(config.weights.product_fit, 25.0);
+        assert_eq!(config.weights.total(), 100.0);
+        assert_eq!(config.threshold_for(Vertical::ConferencesWebinars), 50);
+        assert_eq!(config.threshold_for(Vertical::HrRecruiting), 65);
+    }
+
+    #[test]
+    fn version_two_scores_a_conference_opportunity_above_the_new_threshold() {
+        let config = ScoringConfig::default_v2();
+        let result = score(
+            &config,
+            &ScoreInputs {
+                relevance_probability: 0.85,
+                buying_intent: BuyingIntent::Moderate,
+                business_potential: BusinessPotential::High,
+                product_fit: ProductFit::Good,
+                published_at: Some("2024-05-01T10:00:00Z".to_string()),
+                engagement: Some(EngagementCounts {
+                    comments: 4,
+                    upvotes: 2,
+                    shares: 0,
+                }),
+            },
+            at("2024-05-02T10:00:00Z"),
+        );
+        assert!(
+            result.score >= 50,
+            "score {} should clear the conference threshold",
+            result.score
+        );
     }
 
     #[test]

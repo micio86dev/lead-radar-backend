@@ -358,8 +358,14 @@ pub async fn seed_all(config: &AppConfig, db: &Db) -> anyhow::Result<SeedReport>
         report.communities += 1;
     }
 
-    // Default scoring configuration.
-    let scoring = ScoringConfig::default_v1();
+    // Default scoring configuration: version 1 stays in history, version 2 is the active one.
+    let historical = ScoringConfig::default_v1();
+    historical
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid historical scoring configuration: {error}"))?;
+    qualification::save_scoring_version(db, &tenant_id, &historical, false).await?;
+
+    let scoring = ScoringConfig::default_v2();
     scoring
         .validate()
         .map_err(|error| anyhow::anyhow!("invalid default scoring configuration: {error}"))?;
