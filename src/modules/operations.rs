@@ -568,6 +568,9 @@ pub struct CostGuardInput {
     pub max_concurrent_runs: i64,
     pub total_spend: f64,
     pub daily_spend: f64,
+    /// Provider-reported spend today in the provider's own currency (USD for Apify).
+    pub daily_spend_usd: f64,
+    pub daily_charge_usd: f64,
     pub run_cost_estimate: Option<f64>,
     pub max_run_cost: f64,
     pub daily_budget: f64,
@@ -598,7 +601,7 @@ pub fn cost_guard(input: &CostGuardInput) -> Result<(), CostGuardReason> {
     if input.total_spend >= input.total_budget {
         return Err(CostGuardReason::BudgetExhausted);
     }
-    if input.daily_spend >= input.daily_budget {
+    if input.daily_spend >= input.daily_budget || input.daily_spend_usd >= input.daily_charge_usd {
         return Err(CostGuardReason::DailyCeilingReached);
     }
     if input.running_runs >= input.max_concurrent_runs {
@@ -640,6 +643,8 @@ mod tests {
             max_concurrent_runs: 2,
             total_spend: 0.5,
             daily_spend: 0.1,
+            daily_spend_usd: 0.05,
+            daily_charge_usd: 1.0,
             run_cost_estimate: Some(0.2),
             max_run_cost: 0.5,
             daily_budget: 2.0,
@@ -713,6 +718,13 @@ mod tests {
         assert_eq!(
             cost_guard(&CostGuardInput {
                 daily_spend: 2.0,
+                ..guard()
+            }),
+            Err(CostGuardReason::DailyCeilingReached)
+        );
+        assert_eq!(
+            cost_guard(&CostGuardInput {
+                daily_spend_usd: 1.0,
                 ..guard()
             }),
             Err(CostGuardReason::DailyCeilingReached)

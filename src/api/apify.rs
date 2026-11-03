@@ -346,6 +346,44 @@ pub async fn cancel_run(
     Ok((StatusCode::ACCEPTED, Json(json!({"status": "aborted"}))))
 }
 
+#[utoipa::path(post, path = "/api/v1/providers/apify/runs/{id}/reingest", tag = "apify", responses((status = 202, description = "Dataset queued for re-ingestion"), (status = 409, description = "Run has no dataset yet")))]
+pub async fn reingest_run(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Path(id): Path<String>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let tenant = &context.tenant_id;
+    let run = sources::get_apify_run(&state.db, tenant, &id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let dataset_id = run.dataset_id.clone().ok_or_else(|| {
+        AppError::Conflict("run has no dataset yet; wait for it to succeed".to_string())
+    })?;
+    let (job_id, created) = operations::enqueue(
+        &state.db,
+        Some(tenant),
+        JobKind::DatasetIngestion,
+        &json!({"apify_run_id": run.id, "dataset_id": dataset_id, "offset": 0}),
+        None,
+        state.config.worker.max_attempts,
+    )
+    .await?;
+    operations::audit(
+        &state.db,
+        tenant,
+        &context.actor,
+        "apify_run_reingested",
+        "apify_run",
+        Some(&id),
+        &json!({"dataset_id": dataset_id, "job_id": job_id, "created": created}),
+    )
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"job_id": job_id, "run_id": run.id, "dataset_id": dataset_id})),
+    ))
+}
+
 #[utoipa::path(get, path = "/api/v1/providers/apify/usage", tag = "apify", responses((status = 200, description = "Budget and usage")))]
 pub async fn usage(
     State(state): State<SharedState>,

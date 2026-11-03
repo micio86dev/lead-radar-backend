@@ -118,6 +118,9 @@ pub struct ApifyConfig {
     pub max_run_cost_eur: f64,
     /// Provider-side per-run cap in USD (`maxTotalChargeUsd`), enforced by Apify itself.
     pub max_total_charge_usd: f64,
+    /// Daily ceiling on provider-reported USD spend. Apify reports USD and the EUR ceilings cannot be
+    /// compared with it without inventing an exchange rate, so this is a separate, explicit ceiling.
+    pub daily_charge_usd: f64,
     pub daily_budget_eur: f64,
     pub total_budget_eur: f64,
     pub kill_switch: bool,
@@ -353,6 +356,7 @@ impl AppConfig {
                 max_items_per_run: integer("APIFY_MAX_ITEMS_PER_RUN", 50)?,
                 max_run_cost_eur: number("APIFY_MAX_RUN_COST", 0.5)?,
                 max_total_charge_usd: number("APIFY_MAX_TOTAL_CHARGE_USD", 0.25)?,
+                daily_charge_usd: number("APIFY_DAILY_CHARGE_USD", 1.0)?,
                 daily_budget_eur: number("APIFY_DAILY_BUDGET", 2.0)?,
                 total_budget_eur: number("APIFY_TOTAL_BUDGET", 25.0)?,
                 kill_switch: flag("APIFY_KILL_SWITCH", false)?,
@@ -426,6 +430,7 @@ impl AppConfig {
         for (name, value) in [
             ("APIFY_MAX_RUN_COST", apify.max_run_cost_eur),
             ("APIFY_MAX_TOTAL_CHARGE_USD", apify.max_total_charge_usd),
+            ("APIFY_DAILY_CHARGE_USD", apify.daily_charge_usd),
             ("APIFY_DAILY_BUDGET", apify.daily_budget_eur),
             ("APIFY_TOTAL_BUDGET", apify.total_budget_eur),
         ] {
@@ -543,6 +548,7 @@ mod tests {
         assert_eq!(config.apify.max_concurrent_runs, 2);
         assert_eq!(config.apify.total_budget_eur, 25.0);
         assert_eq!(config.apify.max_total_charge_usd, 0.25);
+        assert_eq!(config.apify.daily_charge_usd, 1.0);
         assert!(config.apify.daily_budget_eur <= config.apify.total_budget_eur);
         assert!(!config.apify.kill_switch);
         assert_eq!(config.jev.model, "jev-1.13");

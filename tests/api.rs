@@ -307,6 +307,43 @@ async fn apify_runs_pass_the_cost_guard_before_being_queued() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["total"].as_i64().expect("total") >= 1);
 
+    // The run lifecycle is asynchronous: drain, then wait for the poll requeue to finish it.
+    let mut run_status = String::new();
+    let mut listing = serde_json::Value::Null;
+    for _ in 0..20 {
+        lead_radar::worker::drain(&app.state, 30)
+            .await
+            .expect("drain");
+        let (_, current) = get(&app, "/api/v1/providers/apify/runs").await;
+        listing = current;
+        run_status = listing["items"][0]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if run_status == "succeeded" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    assert_eq!(run_status, "succeeded", "{listing}");
+
+    // Re-processing the collected dataset needs no new provider run.
+    let succeeded = listing["items"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .find(|run| run["status"] == "succeeded")
+        .unwrap_or_else(|| panic!("succeeded run missing in {listing}"));
+    let run_id = succeeded["id"].as_str().expect("run id");
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/providers/apify/runs/{run_id}/reingest"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(body["job_id"].is_string());
+
     // A zero daily ceiling blocks the next billable run.
     let (status, _) = patch(
         &app,

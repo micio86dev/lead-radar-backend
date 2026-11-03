@@ -260,6 +260,54 @@ pub async fn import_posts(
             .bind(&hash)
             .fetch_optional(&db.reader)
             .await?;
+            if let Some(existing) = &existing {
+                // A later payload may carry metadata the first import lacked (community, URL, author,
+                // engagement). Fill only what is missing; never overwrite collected values.
+                sqlx::query(
+                    "UPDATE discovered_posts SET community = COALESCE(community, ?), \
+                     source_url = COALESCE(source_url, ?), author = COALESCE(author, ?), \
+                     language = COALESCE(language, ?), published_at = COALESCE(published_at, ?), \
+                     source_id = COALESCE(source_id, ?), external_id = COALESCE(external_id, ?), \
+                     engagement_comments = COALESCE(engagement_comments, ?), \
+                     engagement_upvotes = COALESCE(engagement_upvotes, ?), \
+                     engagement_shares = COALESCE(engagement_shares, ?), updated_at = ? \
+                     WHERE tenant_id = ? AND id = ?",
+                )
+                .bind(&post.community)
+                .bind(&post.url)
+                .bind(&post.author)
+                .bind(&language)
+                .bind(&post.published_at)
+                .bind(source_id)
+                .bind(&post.external_id)
+                .bind(engagement.as_ref().map(|value| value.comments))
+                .bind(engagement.as_ref().map(|value| value.upvotes))
+                .bind(engagement.as_ref().map(|value| value.shares))
+                .bind(now_iso())
+                .bind(tenant_id)
+                .bind(existing)
+                .execute(&db.writer)
+                .await?;
+                // Keep the lead's copy of the same provenance in sync.
+                sqlx::query(
+                    "UPDATE leads SET community = COALESCE(community, ?), \
+                     source_url = COALESCE(source_url, ?), author = COALESCE(author, ?), \
+                     language = COALESCE(language, ?), published_at = COALESCE(published_at, ?), \
+                     source_id = COALESCE(source_id, ?), updated_at = ? \
+                     WHERE tenant_id = ? AND post_id = ?",
+                )
+                .bind(&post.community)
+                .bind(&post.url)
+                .bind(&post.author)
+                .bind(&language)
+                .bind(&post.published_at)
+                .bind(source_id)
+                .bind(now_iso())
+                .bind(tenant_id)
+                .bind(existing)
+                .execute(&db.writer)
+                .await?;
+            }
             insert_item(
                 db,
                 &run_id,
@@ -309,7 +357,9 @@ pub async fn import_posts(
         .await?;
 
     let mut normalization_job_id = None;
-    if imported > 0 {
+    // Duplicates still reference posts worth (re)filtering: re-processing a paid dataset after a
+    // keyword change must not require a new Apify run.
+    if imported + duplicates > 0 {
         let (job_id, _) = operations::enqueue(
             db,
             Some(tenant_id),
@@ -438,7 +488,8 @@ pub async fn run_post_ids(
     sqlx::query_scalar(
         "SELECT i.post_id FROM ingestion_items i \
          JOIN ingestion_runs r ON r.id = i.ingestion_run_id \
-         WHERE r.tenant_id = ? AND i.ingestion_run_id = ? AND i.status = 'imported' \
+         WHERE r.tenant_id = ? AND i.ingestion_run_id = ? \
+         AND i.status IN ('imported', 'duplicate') \
          AND i.post_id IS NOT NULL ORDER BY i.created_at",
     )
     .bind(tenant_id)
@@ -451,7 +502,7 @@ pub async fn run_post_ids(
 /// canonical host when the item also identifies a subreddit/community, and left empty rather than
 /// guessed for an unknown provider.
 pub fn absolute_url(item: &Value) -> Option<String> {
-    let raw = ["url", "permalink", "link"]
+    let raw = ["postUrl", "contentUrl", "url", "permalink", "link"]
         .iter()
         .find_map(|key| item.get(*key).and_then(Value::as_str))?
         .trim();
@@ -474,6 +525,25 @@ pub fn absolute_url(item: &Value) -> Option<String> {
     None
 }
 
+/// Community/subreddit name, normalised: `r/recruiting` and `recruiting` both become `recruiting`.
+pub fn community_name(item: &Value) -> Option<String> {
+    let raw = [
+        "parsedCommunityName",
+        "communityName",
+        "community",
+        "subreddit",
+        "forum",
+        "channel",
+    ]
+    .iter()
+    .find_map(|key| item.get(*key).and_then(Value::as_str))?
+    .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.trim_start_matches("r/").to_string())
+}
+
 /// Generic dataset mapping: documented aliases only, no Actor-specific assumptions.
 pub fn map_dataset_item(item: &Value) -> Option<ImportPost> {
     let content = ["content", "text", "body", "selftext", "description"]
@@ -486,15 +556,16 @@ pub fn map_dataset_item(item: &Value) -> Option<ImportPost> {
             .map(str::to_string)
     };
     Some(ImportPost {
-        external_id: string(&["id", "external_id", "url"]),
+        external_id: string(&["id", "parsedId", "external_id"]),
         title: string(&["title", "headline"]),
         content,
         url: absolute_url(item),
-        author: string(&["author", "username", "user"]),
-        community: string(&["community", "subreddit", "forum", "channel"]),
-        language: string(&["language", "lang"]),
+        author: string(&["author", "authorName", "username", "user"]),
+        community: community_name(item),
+        language: string(&["language", "lang", "detectedLanguage"]),
         published_at: string(&[
             "published_at",
+            "publishedAt",
             "createdAt",
             "created_at",
             "date",
@@ -504,11 +575,13 @@ pub fn map_dataset_item(item: &Value) -> Option<ImportPost> {
             comments: item
                 .pointer("/engagement/comments")
                 .and_then(Value::as_i64)
+                .or_else(|| item.get("commentsCount").and_then(Value::as_i64))
                 .or_else(|| item.get("num_comments").and_then(Value::as_i64))
                 .unwrap_or(0),
             upvotes: item
                 .pointer("/engagement/upvotes")
                 .and_then(Value::as_i64)
+                .or_else(|| item.get("upVotes").and_then(Value::as_i64))
                 .or_else(|| item.get("score").and_then(Value::as_i64))
                 .unwrap_or(0),
             shares: item
@@ -573,6 +646,38 @@ mod tests {
         // A relative path with no host hint stays empty instead of being guessed.
         let unknown = serde_json::json!({"text": "body", "url": "/p/1"});
         assert_eq!(map_dataset_item(&unknown).expect("mapped").url, None);
+    }
+
+    #[test]
+    fn maps_the_second_actor_payload_shape() {
+        let item = serde_json::json!({
+            "id": "t3_1piafgn",
+            "parsedId": "1piafgn",
+            "title": "Experienced Recruiters",
+            "body": "Text of the post about multilingual interviews.",
+            "postUrl": "https://www.reddit.com/r/recruiting/comments/1piafgn/x/",
+            "communityName": "r/recruiting",
+            "parsedCommunityName": "recruiting",
+            "authorName": "someone",
+            "createdAt": "2025-12-09T15:33:25.000Z",
+            "upVotes": 3,
+            "commentsCount": 5
+        });
+        let post = map_dataset_item(&item).expect("mapped");
+        assert_eq!(post.external_id.as_deref(), Some("t3_1piafgn"));
+        assert_eq!(post.community.as_deref(), Some("recruiting"));
+        assert_eq!(
+            post.url.as_deref(),
+            Some("https://www.reddit.com/r/recruiting/comments/1piafgn/x/")
+        );
+        assert_eq!(post.author.as_deref(), Some("someone"));
+        assert_eq!(
+            post.published_at.as_deref(),
+            Some("2025-12-09T15:33:25.000Z")
+        );
+        let engagement = post.engagement.expect("engagement");
+        assert_eq!(engagement.upvotes, 3);
+        assert_eq!(engagement.comments, 5);
     }
 
     #[test]

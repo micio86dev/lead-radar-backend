@@ -97,6 +97,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/providers/apify/actors/{id}", patch(apify::patch_actor))
         .route("/providers/apify/runs/{id}", get(apify::get_run))
         .route("/providers/apify/runs/{id}/cancel", post(apify::cancel_run))
+        .route(
+            "/providers/apify/runs/{id}/reingest",
+            post(apify::reingest_run),
+        )
         .route("/providers/apify/usage", get(apify::usage))
         // Providers
         .route("/providers", get(providers::list))
@@ -214,6 +218,7 @@ pub async fn build_state(config: crate::config::AppConfig) -> anyhow::Result<Arc
         apify::start_run,
         apify::get_run,
         apify::cancel_run,
+        apify::reingest_run,
         apify::usage,
         providers::list,
         providers::usage,

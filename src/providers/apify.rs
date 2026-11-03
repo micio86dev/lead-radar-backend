@@ -62,9 +62,19 @@ impl ApifyProvider {
     }
 
     async fn post_json(&self, path: &str, body: Value) -> Result<Value, ProviderError> {
+        self.post_json_with_query(path, &[], body).await
+    }
+
+    async fn post_json_with_query(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        body: Value,
+    ) -> Result<Value, ProviderError> {
         let response = self
             .client
             .post(self.url(path))
+            .query(query)
             .bearer_auth(self.token()?)
             .json(&body)
             .send()
@@ -131,8 +141,9 @@ fn parse_run(value: &Value) -> SourceRun {
         started_at: string_field(data, "startedAt"),
         finished_at: string_field(data, "finishedAt"),
         error: data
-            .pointer("/meta/origin")
+            .get("statusMessage")
             .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
             .map(str::to_string),
     }
 }
@@ -174,13 +185,15 @@ impl SourceProvider for ApifyProvider {
         if let Value::Object(map) = &mut input {
             map.entry("maxItems").or_insert(json!(request.max_items));
         }
-        let path = format!("/v2/acts/{}/runs", request.actor_id);
-        let mut body = json!({ "input": input, "maxItems": request.max_items });
+        // Apify expects the Actor input as the request body and the run options as query parameters:
+        // wrapping the input in `{ "input": ... }` makes the Actor see an empty input.
+        let mut query = vec![("maxItems", request.max_items.max(1).to_string())];
         if let Some(cap) = request.max_total_charge_usd {
             // Enforced by Apify: a pay-per-event run cannot bill beyond this cap.
-            body["maxTotalChargeUsd"] = json!(cap);
+            query.push(("maxTotalChargeUsd", format!("{cap:.2}")));
         }
-        let value = self.post_json(&path, body).await?;
+        let path = format!("/v2/acts/{}/runs", request.actor_id);
+        let value = self.post_json_with_query(&path, &query, input).await?;
         Ok(parse_run(&value))
     }
 
@@ -234,6 +247,7 @@ mod tests {
             max_items_per_run: 10,
             max_run_cost_eur: 0.5,
             max_total_charge_usd: 0.25,
+            daily_charge_usd: 1.0,
             daily_budget_eur: 1.0,
             total_budget_eur: 25.0,
             kill_switch: false,
@@ -274,10 +288,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_run_carries_the_provider_side_charge_cap() {
+    async fn the_run_sends_the_actor_input_as_body_and_options_as_query() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v2/acts/test~actor/runs"))
+            .and(wiremock::matchers::query_param("maxItems", "5"))
+            .and(wiremock::matchers::query_param("maxTotalChargeUsd", "0.10"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "data": {"id": "run-cap", "status": "READY", "defaultDatasetId": "dataset-cap"}
             })))
@@ -286,7 +302,7 @@ mod tests {
         provider(&server)
             .start_run(&SourceRunRequest {
                 actor_id: "test~actor".to_string(),
-                input: json!({"search": "multilingual interviews"}),
+                input: json!({"searches": ["multilingual interviews"], "searchPosts": true}),
                 max_items: 5,
                 max_total_charge_usd: Some(0.1),
             })
@@ -295,9 +311,12 @@ mod tests {
 
         let received = server.received_requests().await.expect("requests");
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
-        assert_eq!(body["maxItems"], 5);
-        assert_eq!(body["maxTotalChargeUsd"], 0.1);
-        assert_eq!(body["input"]["search"], "multilingual interviews");
+        assert_eq!(body["searches"][0], "multilingual interviews");
+        assert_eq!(body["searchPosts"], true);
+        assert!(
+            body.get("input").is_none(),
+            "input must not be wrapped: {body}"
+        );
     }
 
     #[tokio::test]
@@ -349,6 +368,7 @@ mod tests {
             max_items_per_run: 10,
             max_run_cost_eur: 0.5,
             max_total_charge_usd: 0.25,
+            daily_charge_usd: 1.0,
             daily_budget_eur: 1.0,
             total_budget_eur: 25.0,
             kill_switch: false,

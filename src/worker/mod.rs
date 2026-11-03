@@ -518,7 +518,15 @@ async fn poll_actor_run(state: &AppState, job: &JobRow) -> Result<JobOutcome, Jo
         .await?
         .ok_or_else(|| JobError::permanent("actor not found"))?;
 
-    if run.status == "queued" {
+    let provider_run_id: Option<String> =
+        sqlx::query_scalar("SELECT provider_run_id FROM apify_runs WHERE tenant_id = ? AND id = ?")
+            .bind(tenant_id)
+            .bind(&run.id)
+            .fetch_optional(&state.db.reader)
+            .await?
+            .flatten();
+
+    if provider_run_id.is_none() {
         let input_raw = sources::apify_run_input(&state.db, tenant_id, &run.id)
             .await?
             .unwrap_or_else(|| "{}".to_string());
@@ -576,14 +584,8 @@ async fn poll_actor_run(state: &AppState, job: &JobRow) -> Result<JobOutcome, Jo
         }
     }
 
-    let provider_run_id = run.id.clone();
-    let provider_run_id = sqlx::query_scalar::<_, String>(
-        "SELECT provider_run_id FROM apify_runs WHERE id = ? AND provider_run_id IS NOT NULL",
-    )
-    .bind(&provider_run_id)
-    .fetch_optional(&state.db.reader)
-    .await?
-    .ok_or_else(|| JobError::permanent("apify run has no provider run id"))?;
+    let provider_run_id =
+        provider_run_id.ok_or_else(|| JobError::permanent("apify run has no provider run id"))?;
 
     let provider_run = state
         .providers

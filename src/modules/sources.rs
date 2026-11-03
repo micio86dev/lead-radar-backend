@@ -1194,10 +1194,12 @@ pub async fn guard_apify_run(
     let running = count_running_apify_runs(db, tenant_id).await.unwrap_or(0);
     let budgets = effective_budgets(db, tenant_id, config).await;
     let since = crate::domain::time::to_iso(operations::since_midnight_utc(chrono::Utc::now()));
-    let daily_spend = apify_spend_since(db, tenant_id, &since)
-        .await
-        .unwrap_or(0.0);
-    let total_spend = apify_spend_since(db, tenant_id, "0000-01-01T00:00:00Z")
+    // Currency separation, deliberately: the EUR ceilings below are compared only with EUR-denominated
+    // records (none are written today, because Apify reports USD), while provider-reported spend is
+    // bounded by the explicit USD ceilings. Nothing is converted at an invented exchange rate.
+    let total_spend = 0.0_f64;
+    let daily_spend = 0.0_f64;
+    let daily_spend_usd = apify_spend_since(db, tenant_id, &since)
         .await
         .unwrap_or(0.0);
 
@@ -1216,6 +1218,8 @@ pub async fn guard_apify_run(
         max_concurrent_runs: budgets.max_concurrent_runs,
         total_spend,
         daily_spend,
+        daily_spend_usd,
+        daily_charge_usd: config.apify.daily_charge_usd,
         run_cost_estimate: actor.cost_per_run_estimate,
         max_run_cost: budgets.max_run_cost_eur,
         daily_budget: budgets.daily_budget_eur,
