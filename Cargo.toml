@@ -1,0 +1,61 @@
+[package]
+name = "lead-radar"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Lead Radar backend: API and worker for opportunity discovery"
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "lead_radar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "api"
+path = "src/bin/api.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+
+[[bin]]
+name = "db"
+path = "src/bin/db.rs"
+
+[[bin]]
+name = "healthcheck"
+path = "src/bin/healthcheck.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+utoipa = { version = "5", features = ["uuid", "chrono"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+validator = { version = "0.20", features = ["derive"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
+
+[profile.release]
+opt-level = 2
+debug = false
+strip = "symbols"

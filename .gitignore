@@ -1,5 +1,8 @@
-target/
+/target
+/data
 *.db
 *.db-shm
 *.db-wal
 .env
+.env.local
+.DS_Store

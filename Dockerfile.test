@@ -1,0 +1,8 @@
+FROM rust:1.89.0-bookworm
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY migrations ./migrations
+COPY tests ./tests
+RUN cargo fetch --locked
+CMD ["cargo", "test", "--all-targets"]
