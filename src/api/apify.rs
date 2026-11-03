@@ -88,6 +88,81 @@ pub async fn create_actor(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ActorPatchBody {
+    pub enabled: Option<bool>,
+    pub validation_status: Option<String>,
+    pub description: Option<String>,
+    pub max_items_per_run: Option<i64>,
+    pub input_template: Option<serde_json::Value>,
+}
+
+#[utoipa::path(patch, path = "/api/v1/providers/apify/actors/{id}", tag = "apify", responses((status = 200, description = "Updated Actor"), (status = 409, description = "Cannot enable an unvalidated Actor")))]
+pub async fn patch_actor(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Path(id): Path<String>,
+    Json(body): Json<ActorPatchBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    let tenant = &context.tenant_id;
+    let actor = sources::get_actor(&state.db, tenant, &id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let validation = match body.validation_status.as_deref() {
+        Some(raw) => Some(
+            crate::domain::enums::ValidationStatus::parse(raw).ok_or_else(|| {
+                AppError::BadRequest(format!("unknown validation_status {raw:?}"))
+            })?,
+        ),
+        None => None,
+    };
+    let effective_validation = validation
+        .as_ref()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| actor.validation_status.clone());
+    if body.enabled == Some(true) && effective_validation != "validated" {
+        return Err(AppError::Conflict(
+            "actor_not_validated: record validation before enabling this Actor".to_string(),
+        ));
+    }
+    if let Some(items) = body.max_items_per_run {
+        if items < 1 || items > state.config.apify.max_items_per_run {
+            return Err(AppError::Validation(vec![crate::error::FieldError::new(
+                "max_items_per_run",
+                format!(
+                    "must be within 1..={}",
+                    state.config.apify.max_items_per_run
+                ),
+            )]));
+        }
+    }
+    let updated = sources::update_actor(
+        &state.db,
+        tenant,
+        &id,
+        &sources::ActorPatch {
+            enabled: body.enabled,
+            validation_status: validation,
+            description: body.description.as_deref(),
+            max_items_per_run: body.max_items_per_run,
+            input_template: body.input_template.as_ref(),
+        },
+    )
+    .await?
+    .ok_or(AppError::NotFound)?;
+    operations::audit(
+        &state.db,
+        tenant,
+        &context.actor,
+        "actor_updated",
+        "actor_registry",
+        Some(&id),
+        &json!({"enabled": body.enabled, "validation_status": body.validation_status}),
+    )
+    .await?;
+    Ok(Json(json!(updated)))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct StartRunBody {
     pub actor_registry_id: String,
     #[serde(default)]

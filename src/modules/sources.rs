@@ -620,6 +620,79 @@ pub async fn set_actor_validation(
     get_actor(db, tenant_id, id).await
 }
 
+pub struct ActorPatch<'a> {
+    pub enabled: Option<bool>,
+    pub validation_status: Option<ValidationStatus>,
+    pub description: Option<&'a str>,
+    pub max_items_per_run: Option<i64>,
+    pub input_template: Option<&'a Value>,
+}
+
+pub async fn update_actor(
+    db: &Db,
+    tenant_id: &str,
+    id: &str,
+    patch: &ActorPatch<'_>,
+) -> Result<Option<Actor>, sqlx::Error> {
+    let now = now_iso();
+    if let Some(validation) = patch.validation_status {
+        sqlx::query(
+            "UPDATE actor_registry SET validation_status = ?, updated_at = ?              WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(validation.as_str())
+        .bind(&now)
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(enabled) = patch.enabled {
+        sqlx::query(
+            "UPDATE actor_registry SET enabled = ?, updated_at = ? WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(if enabled { 1 } else { 0 })
+        .bind(&now)
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(description) = patch.description {
+        sqlx::query(
+            "UPDATE actor_registry SET description = ?, updated_at = ? WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(description)
+        .bind(&now)
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(items) = patch.max_items_per_run {
+        sqlx::query(
+            "UPDATE actor_registry SET max_items_per_run = ?, updated_at = ?              WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(items.max(1))
+        .bind(&now)
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(template) = patch.input_template {
+        sqlx::query(
+            "UPDATE actor_registry SET input_template = ?, updated_at = ?              WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(to_json(template))
+        .bind(&now)
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    get_actor(db, tenant_id, id).await
+}
+
 pub async fn mark_actor_success(db: &Db, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE actor_registry SET last_success_at = ?, updated_at = ? WHERE id = ?")
         .bind(now_iso())

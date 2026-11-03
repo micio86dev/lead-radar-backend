@@ -10,8 +10,7 @@ use common::{
     call, get, get_as, import_and_lead, now_minus_hours, patch, post, relevant_post, setup,
     setup_with, TOKEN_B,
 };
-use lead_radar::domain::enums::{ValidationStatus, Vertical};
-use lead_radar::modules::sources;
+use lead_radar::domain::enums::Vertical;
 use lead_radar::seed;
 
 #[tokio::test]
@@ -268,16 +267,25 @@ async fn apify_runs_pass_the_cost_guard_before_being_queued() {
     assert_eq!(body["error"]["code"], "cost_guard_rejected");
     assert_eq!(body["error"]["details"]["reason"], "actor_not_enabled");
 
-    // Validate and enable explicitly, then the same call is accepted.
-    sources::set_actor_validation(
-        &app.state.db,
-        app.tenant(),
-        actor_id,
-        ValidationStatus::Validated,
-        true,
+    // Enabling without validation is refused.
+    let (status, body) = patch(
+        &app,
+        &format!("/api/v1/providers/apify/actors/{actor_id}"),
+        json!({"enabled": true}),
     )
-    .await
-    .expect("validated");
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Validate and enable explicitly, then the same call is accepted.
+    let (status, body) = patch(
+        &app,
+        &format!("/api/v1/providers/apify/actors/{actor_id}"),
+        json!({"validation_status": "validated", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["validation_status"], "validated");
+    assert_eq!(body["enabled"], true);
 
     let (status, body) = post(
         &app,
