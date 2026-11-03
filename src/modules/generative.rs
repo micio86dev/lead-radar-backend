@@ -257,6 +257,88 @@ fn parse_variants(
     Ok(parsed)
 }
 
+fn truncate(text: &str, limit: usize) -> String {
+    let mut truncated: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        truncated.push('…');
+    }
+    truncated
+}
+
+/// Rules quoted in the prompt. They mirror `domain::comment::validate` exactly.
+fn policy_rules(language: &str) -> String {
+    let examples = crate::domain::comment::DISCLOSURE_EXAMPLES
+        .iter()
+        .map(|(code, sentence)| format!("{code}: \"{sentence}\""))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(
+        "Rules checked automatically after generation (a draft that breaks one is rejected):\n\
+         - The discussion language is {language}; write every body in it.\n\
+         - soft_pitch and direct_pitch must name VoxTranslate and open with an affiliation \
+         disclosure. Use the documented form for the language: {examples}\n\
+         - Never use any of these phrases: {}.\n\
+         - The helpful variant must stay non-promotional and must not contain: {}.",
+        crate::domain::comment::FORBIDDEN_PHRASES.join(", "),
+        crate::domain::comment::PROMOTIONAL_PHRASES.join(", "),
+    )
+}
+
+#[derive(Debug, Default)]
+struct DraftOutcome {
+    stored: usize,
+    skipped: usize,
+    issues: Vec<String>,
+}
+
+type RejectedDraft = (CommentVariant, String, Vec<CommentIssue>);
+
+/// Validate every draft, store the ones that pass and return the rejected ones with their reasons.
+async fn validate_and_store(
+    state: &AppState,
+    tenant_id: &str,
+    lead_id: &str,
+    language: &str,
+    actor: &str,
+    variants: Vec<(CommentVariant, String)>,
+    outcome: &mut DraftOutcome,
+) -> Result<Vec<RejectedDraft>, GenerativeError> {
+    let mut rejected: Vec<RejectedDraft> = Vec::new();
+    let mut seen: Vec<CommentVariant> = Vec::new();
+    for (variant, body) in variants {
+        if seen.contains(&variant) {
+            outcome.skipped += 1;
+            outcome
+                .issues
+                .push(format!("duplicate variant {}", variant.as_str()));
+            continue;
+        }
+        let draft = CommentDraft {
+            variant,
+            language: language.to_string(),
+            body: body.clone(),
+        };
+        let problems = validate(&draft);
+        if problems.is_empty() {
+            seen.push(variant);
+            store_comment(
+                &state.db, tenant_id, lead_id, variant, &body, language, actor,
+            )
+            .await?;
+            outcome.stored += 1;
+        } else {
+            outcome.skipped += 1;
+            for problem in &problems {
+                outcome
+                    .issues
+                    .push(format!("{}: {problem:?}", variant.as_str()));
+            }
+            rejected.push((variant, body, problems));
+        }
+    }
+    Ok(rejected)
+}
+
 /// Draft the three comment variants for a lead. Only drafts that satisfy the comment policy are
 /// stored, and they are stored as `pending_review`: no publication path exists in code.
 pub async fn generate_comments(
@@ -281,17 +363,21 @@ pub async fn generate_comments(
         .unwrap_or_else(|| crate::domain::language::detect(&post.content));
 
     let system = "You write short, specific replies for a human to review before posting in a \
-public discussion. Rules: write in the discussion's language; answer the actual problem; never \
-invent personal experience, testimonials, pricing or integrations; disclose the affiliation \
-whenever pitching. The \"helpful\" variant must not sell. Answer with JSON only.";
+public discussion. Answer the actual problem, in the discussion's language, and never invent \
+personal experience, testimonials, pricing or integrations. Answer with JSON only.";
+
+    // The prompt quotes the same rules the validator enforces, so the model is never asked to guess
+    // them and the two cannot drift apart.
+    let policy = policy_rules(&language);
     let user = format!(
-        "{}\n\n{}\n\nlanguage: {}\n\nProduce exactly three variants as JSON: \
+        "{}\n\n{}\n\nlanguage: {}\n\n{}\n\nProduce exactly three variants as JSON: \
 {{\"variants\":[{{\"variant\":\"helpful\",\"body\":\"...\"}},{{\"variant\":\"soft_pitch\",\
 \"body\":\"...\"}},{{\"variant\":\"direct_pitch\",\"body\":\"...\"}}]}}. Each body must be one \
 paragraph between 40 and 1200 characters.",
         lead_context(&lead, &post.content, &evidence),
         PRODUCT_CONTEXT,
         language,
+        policy,
     );
 
     if let Some(false) =
@@ -301,50 +387,79 @@ paragraph between 40 and 1200 characters.",
             "generative provider disabled by tenant settings".to_string(),
         ));
     }
+
+    let mut calls = Vec::new();
     let result = state
         .providers
         .generative
         .generate_json(system, &user, "comment_variants")
         .await?;
-    let parsed = parse_variants(&result.content)?;
-    if parsed.len() != 3 {
+    let pending = parse_variants(&result.content)?;
+    if pending.len() != 3 {
         return Err(GenerativeError::InvalidContent(format!(
             "expected 3 variants, got {}",
-            parsed.len()
+            pending.len()
         )));
     }
+    let mut draft = DraftOutcome::default();
+    let rejected = validate_and_store(
+        state, tenant_id, lead_id, &language, actor, pending, &mut draft,
+    )
+    .await?;
+    let mut corrective_content = None;
 
-    let mut stored = 0usize;
-    let mut skipped = 0usize;
-    let mut issues = Vec::new();
-    let mut seen: Vec<CommentVariant> = Vec::new();
-
-    for (variant, body) in parsed {
-        if seen.contains(&variant) {
-            skipped += 1;
-            issues.push(format!("duplicate variant {}", variant.as_str()));
-            continue;
-        }
-        let draft = CommentDraft {
-            variant,
-            language: language.clone(),
-            body: body.clone(),
-        };
-        let problems: Vec<CommentIssue> = validate(&draft);
-        if !problems.is_empty() {
-            skipped += 1;
-            for problem in problems {
-                issues.push(format!("{}: {problem:?}", variant.as_str()));
-            }
-            continue;
-        }
-        seen.push(variant);
-        store_comment(
-            &state.db, tenant_id, lead_id, variant, &body, &language, actor,
+    // One bounded corrective pass, same provider, only for the variants that failed the policy.
+    if !rejected.is_empty() {
+        let failures = rejected
+            .iter()
+            .map(|(variant, body, problems)| {
+                format!(
+                    "- {} ({}) failed: {}",
+                    variant.as_str(),
+                    truncate(body, 120),
+                    problems
+                        .iter()
+                        .map(|problem| format!("{problem:?}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let corrective_prompt = format!(
+            "{user}\n\nYour previous drafts failed these automatic checks:\n{failures}\n\n\
+             Return the same JSON shape with all three variants and rewrite the failed ones so that \
+             they pass every rule. Keep the bodies that already passed unchanged."
+        );
+        let retry = state
+            .providers
+            .generative
+            .generate_json(system, &corrective_prompt, "comment_variants")
+            .await?;
+        let failed: Vec<CommentVariant> = rejected.iter().map(|(variant, _, _)| *variant).collect();
+        let mut retry_variants = parse_variants(&retry.content)?;
+        retry_variants.retain(|(variant, _)| failed.contains(variant));
+        // A second rejection is final: the remaining variants stay unstored and are reported.
+        validate_and_store(
+            state,
+            tenant_id,
+            lead_id,
+            &language,
+            actor,
+            retry_variants,
+            &mut draft,
         )
         .await?;
-        stored += 1;
+        corrective_content = Some(retry.content.clone());
+        calls.push(retry);
     }
+    calls.push(result);
+
+    let stored = draft.stored;
+    let skipped = draft.skipped;
+    let issues = draft.issues;
+    let primary = calls.pop().expect("primary call recorded");
+    let corrective_pass = corrective_content.is_some();
 
     sqlx::query(
         "INSERT INTO ai_analyses (id, tenant_id, post_id, kind, provider, model, prompt_summary, \
@@ -354,42 +469,38 @@ paragraph between 40 and 1200 characters.",
     .bind(new_id())
     .bind(tenant_id)
     .bind(&lead.post_id)
-    .bind(&result.provider)
-    .bind(&result.model)
+    .bind(&primary.provider)
+    .bind(&primary.model)
     .bind(format!("lead {lead_id}"))
-    .bind(format!("stored {stored} variants, skipped {skipped}"))
-    .bind(to_json(
-        &json!({"content": result.content, "issues": issues}),
+    .bind(format!(
+        "stored {stored} variants, skipped {skipped}, corrective pass: {corrective_pass}"
     ))
-    .bind(result.input_tokens)
-    .bind(result.output_tokens)
-    .bind(result.latency_ms)
+    .bind(to_json(&json!({
+        "content": primary.content,
+        "corrective_content": corrective_content,
+        "issues": issues,
+        "corrective_pass": corrective_pass,
+    })))
+    .bind(primary.input_tokens)
+    .bind(primary.output_tokens)
+    .bind(primary.latency_ms)
     .bind(now_iso())
     .execute(&state.db.writer)
     .await?;
 
-    record_generation_usage(
-        &state.db,
-        tenant_id,
-        "comment_generation",
-        &result.provider,
-        result.input_tokens,
-        result.output_tokens,
-        result.latency_ms,
-        result.request_id.as_deref(),
-    )
-    .await?;
-
-    operations::audit(
-        &state.db,
-        tenant_id,
-        actor,
-        "comments_generated",
-        "lead",
-        Some(lead_id),
-        &json!({"stored": stored, "skipped": skipped, "issues": issues}),
-    )
-    .await?;
+    for call in std::iter::once(&primary).chain(calls.iter()) {
+        record_generation_usage(
+            &state.db,
+            tenant_id,
+            "comment_generation",
+            &call.provider,
+            call.input_tokens,
+            call.output_tokens,
+            call.latency_ms,
+            call.request_id.as_deref(),
+        )
+        .await?;
+    }
 
     if stored == 0 {
         return Err(GenerativeError::InvalidContent(issues.join("; ")));

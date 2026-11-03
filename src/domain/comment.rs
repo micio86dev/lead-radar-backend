@@ -11,7 +11,7 @@ pub const MIN_BODY_CHARS: usize = 40;
 pub const MAX_BODY_CHARS: usize = 1200;
 
 /// Claims a model must never make on the user's behalf.
-const FORBIDDEN_PHRASES: [&str; 9] = [
+pub const FORBIDDEN_PHRASES: [&str; 9] = [
     "i personally",
     "in my experience",
     "we guarantee",
@@ -24,7 +24,7 @@ const FORBIDDEN_PHRASES: [&str; 9] = [
 ];
 
 /// Sales language that does not belong in the "helpful" variant.
-const PROMOTIONAL_PHRASES: [&str; 6] = [
+pub const PROMOTIONAL_PHRASES: [&str; 6] = [
     "sign up",
     "book a demo",
     "start your free trial",
@@ -34,7 +34,7 @@ const PROMOTIONAL_PHRASES: [&str; 6] = [
 ];
 
 /// Affiliation can be disclosed in the discussion's language; these are the accepted forms.
-const DISCLOSURE_MARKERS: [&str; 15] = [
+pub const DISCLOSURE_MARKERS: [&str; 15] = [
     "i work on",
     "i work at",
     "i build",
@@ -50,6 +50,17 @@ const DISCLOSURE_MARKERS: [&str; 15] = [
     "je travaille sur",
     "ich arbeite",
     "hinweis:",
+];
+
+/// One disclosure sentence per supported language. The generator prompt quotes these examples, and a
+/// test proves each of them satisfies the validator, so prompt and policy cannot drift apart.
+pub const DISCLOSURE_EXAMPLES: [(&str, &str); 6] = [
+    ("en", "Disclosure: I work on VoxTranslate."),
+    ("es", "Aviso: trabajo en VoxTranslate."),
+    ("pt", "Aviso: trabalho na VoxTranslate."),
+    ("it", "Avviso: lavoro su VoxTranslate."),
+    ("fr", "Avis : je travaille sur VoxTranslate."),
+    ("de", "Hinweis: ich arbeite an VoxTranslate."),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +224,23 @@ mod tests {
             CommentIssue::LanguageMismatch { expected, detected }
                 if expected == "es" && detected == "en"
         )));
+    }
+
+    #[test]
+    fn every_documented_disclosure_example_is_accepted_by_the_policy() {
+        for (language, sentence) in DISCLOSURE_EXAMPLES {
+            let lowered = sentence.to_lowercase();
+            assert!(
+                lowered.contains("voxtranslate"),
+                "example for {language} must name the product"
+            );
+            assert!(
+                DISCLOSURE_MARKERS
+                    .iter()
+                    .any(|marker| lowered.contains(marker)),
+                "example for {language} must contain an accepted disclosure marker: {sentence}"
+            );
+        }
     }
 
     #[test]

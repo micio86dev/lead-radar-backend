@@ -193,11 +193,22 @@ impl QwenConfig {
     }
 
     /// OpenAI-compatible chat completions endpoint.
+    ///
+    /// Hosted providers document their base URL either as `https://host` or as
+    /// `https://host/compatible-mode/v1` (the OpenAI SDK convention). Both shapes are accepted:
+    /// the version segment is added only when it is missing.
     pub fn endpoint(&self) -> Option<String> {
         self.base_url
             .as_deref()
             .filter(|base| !base.trim().is_empty())
-            .map(|base| join_url(base, "/v1/chat/completions"))
+            .map(|base| {
+                let base = base.trim().trim_end_matches('/');
+                if base.ends_with("/v1") {
+                    join_url(base, "/chat/completions")
+                } else {
+                    join_url(base, "/v1/chat/completions")
+                }
+            })
     }
 }
 
@@ -578,6 +589,27 @@ mod tests {
         assert!(!config.jev.configured());
         assert!(!config.qwen.configured());
         assert!(!config.apify.configured());
+    }
+
+    #[test]
+    fn qwen_endpoint_accepts_both_base_url_conventions() {
+        let mut vars = base_map();
+        vars.insert("QWEN_BASE_URL".into(), "https://host.example".into());
+        let config = AppConfig::from_map(&vars).expect("config");
+        assert_eq!(
+            config.qwen.endpoint().as_deref(),
+            Some("https://host.example/v1/chat/completions")
+        );
+
+        vars.insert(
+            "QWEN_BASE_URL".into(),
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/".into(),
+        );
+        let config = AppConfig::from_map(&vars).expect("config");
+        assert_eq!(
+            config.qwen.endpoint().as_deref(),
+            Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions")
+        );
     }
 
     #[test]
