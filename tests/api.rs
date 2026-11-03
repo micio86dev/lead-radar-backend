@@ -409,7 +409,52 @@ async fn communities_and_sources_cannot_be_enabled_without_validation() {
 }
 
 #[tokio::test]
-async fn seeds_activate_scoring_version_two() {
+async fn rescore_recomputes_from_stored_decisions_without_calling_providers() {
+    let app = setup().await;
+    let lead_id = import_and_lead(&app).await;
+
+    // Make the stored score stale and drop its history, then rescore.
+    sqlx::query(
+        "UPDATE leads SET score = 1, score_category = 'low', qualification_status = 'rejected' \
+         WHERE tenant_id = ? AND id = ?",
+    )
+    .bind(app.tenant())
+    .bind(&lead_id)
+    .execute(&app.db().writer)
+    .await
+    .expect("stale score");
+    sqlx::query("DELETE FROM lead_scores WHERE lead_id = ?")
+        .bind(&lead_id)
+        .execute(&app.db().writer)
+        .await
+        .expect("clear history");
+
+    let outcome = lead_radar::modules::qualification::rescore_tenant(
+        app.db(),
+        app.tenant(),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("rescore");
+    assert!(outcome.examined >= 1, "{outcome:?}");
+    assert!(outcome.updated >= 1, "{outcome:?}");
+    assert_eq!(outcome.version, 3);
+
+    let (score, version): (i64, i64) = sqlx::query_as(
+        "SELECT l.score, s.score_version FROM leads l \
+         JOIN lead_scores s ON s.lead_id = l.id WHERE l.id = ? \
+         ORDER BY s.created_at DESC LIMIT 1",
+    )
+    .bind(&lead_id)
+    .fetch_one(&app.db().reader)
+    .await
+    .expect("rescored row");
+    assert!(score > 1, "score recomputed: {score}");
+    assert_eq!(version, 3);
+}
+
+#[tokio::test]
+async fn seeds_activate_the_latest_scoring_version() {
     let app = setup().await;
     let active: (i64, String, String) = sqlx::query_as(
         "SELECT version, weights, thresholds FROM lead_score_versions \
@@ -419,11 +464,16 @@ async fn seeds_activate_scoring_version_two() {
     .fetch_one(&app.db().reader)
     .await
     .expect("active scoring version");
-    assert_eq!(active.0, 2);
+    assert_eq!(active.0, 3);
     assert!(active.1.contains("\"product_fit\":25"));
     assert!(
         active.2.contains("\"conferences_webinars\":50"),
         "conference threshold lowered: {}",
+        active.2
+    );
+    assert!(
+        active.2.contains("\"customer_support\":60"),
+        "support threshold lowered: {}",
         active.2
     );
 }
@@ -542,7 +592,28 @@ async fn search_profiles_are_created_and_filtered_with_configured_keywords() {
         .iter()
         .find(|profile| profile["vertical"] == "hr_recruiting")
         .expect("hr profile");
-    assert_eq!(hr["keywords"].as_array().expect("keywords").len(), 10);
+    // The product specification's ten HR keywords are present; real-world variants are added on top.
+    let hr_keywords: Vec<&str> = hr["keywords"]
+        .as_array()
+        .expect("keywords")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    for expected in [
+        "multilingual recruitment",
+        "international hiring",
+        "language barrier interview",
+        "multilingual interviews",
+        "real-time translation interview",
+        "global workforce communication",
+        "non-native speakers interview",
+        "cross-border recruitment",
+        "interview interpretation",
+        "international HR communication",
+    ] {
+        assert!(hr_keywords.contains(&expected), "missing {expected}");
+    }
+    assert!(hr_keywords.len() >= 10);
 
     let (status, body) = post(
         &app,

@@ -1,10 +1,15 @@
 //! Versioned scoring configuration, leads and score history.
 
+use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::FromRow;
 
 use crate::db::Db;
+use crate::domain::enums::{
+    BusinessPotential, BuyingIntent, CustomerType, Intent, ProductFit, Vertical,
+};
 use crate::domain::evidence::Evidence;
+use crate::domain::qualification::qualify;
 use crate::domain::scoring::{QualificationThresholds, ScoreBands, ScoringConfig, ScoringWeights};
 use crate::domain::time::now_iso;
 use crate::modules::{from_json_or, new_id, to_json};
@@ -472,6 +477,165 @@ pub async fn lead_counts_by_intent(
     .bind(tenant_id)
     .fetch_all(&db.reader)
     .await
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RescoreOutcome {
+    pub examined: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub version: i64,
+}
+
+/// Recompute score and qualification for every active lead of a tenant from the decisions already
+/// stored, using the active scoring configuration. No provider is called: changing weights or
+/// thresholds never requires paying for the same analysis twice.
+pub async fn rescore_tenant(
+    db: &Db,
+    tenant_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RescoreOutcome, sqlx::Error> {
+    let config = active_scoring_config(db, tenant_id).await?;
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: String,
+        vertical_primary: String,
+        intent: String,
+        customer_type: String,
+        buying_intent: String,
+        business_potential: String,
+        product_fit: String,
+        confidence: Option<f64>,
+        evidence: String,
+        published_at: Option<String>,
+        score: Option<i64>,
+        engagement_comments: Option<i64>,
+        engagement_upvotes: Option<i64>,
+        engagement_shares: Option<i64>,
+        decision_run_id: Option<String>,
+        relevance: Option<f64>,
+        evidence_sufficient: Option<f64>,
+        too_ambiguous: Option<f64>,
+        needs_human_review: Option<f64>,
+    }
+
+    let rows = sqlx::query_as::<_, Row>(
+        "WITH latest AS ( \
+           SELECT r.id, r.post_id, \
+                  ROW_NUMBER() OVER (PARTITION BY r.post_id ORDER BY r.created_at DESC) AS rn \
+           FROM decision_runs r WHERE r.tenant_id = ? AND r.status = 'succeeded' \
+         ) \
+         SELECT l.id, l.vertical_primary, l.intent, l.customer_type, l.buying_intent, \
+                l.business_potential, l.product_fit, l.confidence, l.evidence, l.published_at, l.score, \
+                p.engagement_comments, p.engagement_upvotes, p.engagement_shares, \
+                latest.id AS decision_run_id, \
+                (SELECT a.noul FROM decision_answers a WHERE a.decision_run_id = latest.id \
+                   AND a.question = 'relevance') AS relevance, \
+                (SELECT a.noul FROM decision_answers a WHERE a.decision_run_id = latest.id \
+                   AND a.question = 'evidence_sufficient') AS evidence_sufficient, \
+                (SELECT a.noul FROM decision_answers a WHERE a.decision_run_id = latest.id \
+                   AND a.question = 'too_ambiguous') AS too_ambiguous, \
+                (SELECT a.noul FROM decision_answers a WHERE a.decision_run_id = latest.id \
+                   AND a.question = 'needs_human_review') AS needs_human_review \
+         FROM leads l \
+         JOIN discovered_posts p ON p.id = l.post_id \
+         LEFT JOIN latest ON latest.post_id = l.post_id AND latest.rn = 1 \
+         WHERE l.tenant_id = ? AND l.is_active = 1 \
+         ORDER BY l.id",
+    )
+    .bind(tenant_id)
+    .bind(tenant_id)
+    .fetch_all(&db.reader)
+    .await?;
+
+    let mut outcome = RescoreOutcome {
+        version: config.version,
+        ..Default::default()
+    };
+    for row in rows {
+        outcome.examined += 1;
+        let Some(relevance) = row.relevance else {
+            // Without a stored decision there is nothing to recompute; the lead stays as it is.
+            outcome.skipped += 1;
+            continue;
+        };
+        let vertical = Vertical::parse(&row.vertical_primary).unwrap_or(Vertical::Other);
+        let intent = Intent::parse(&row.intent).unwrap_or(Intent::Irrelevant);
+        let customer_type =
+            CustomerType::parse(&row.customer_type).unwrap_or(CustomerType::Unknown);
+        let buying_intent = BuyingIntent::parse(&row.buying_intent).unwrap_or(BuyingIntent::None);
+        let business_potential =
+            BusinessPotential::parse(&row.business_potential).unwrap_or(BusinessPotential::Low);
+        let product_fit = ProductFit::parse(&row.product_fit).unwrap_or(ProductFit::Poor);
+        let evidence: Vec<crate::domain::evidence::Evidence> =
+            from_json_or(&row.evidence, Vec::new());
+        let engagement = match (
+            row.engagement_comments,
+            row.engagement_upvotes,
+            row.engagement_shares,
+        ) {
+            (None, None, None) => None,
+            (comments, upvotes, shares) => Some(crate::domain::scoring::EngagementCounts {
+                comments: comments.unwrap_or(0),
+                upvotes: upvotes.unwrap_or(0),
+                shares: shares.unwrap_or(0),
+            }),
+        };
+        let inputs = crate::domain::scoring::ScoreInputs {
+            relevance_probability: relevance,
+            buying_intent,
+            business_potential,
+            product_fit,
+            published_at: row.published_at.clone(),
+            engagement,
+        };
+        let scored = crate::domain::scoring::score(&config, &inputs, now);
+        let confident = row.confidence.unwrap_or(0.0);
+        let qualification = qualify(&crate::domain::qualification::QualificationInput {
+            relevance,
+            intent,
+            customer_type,
+            evidence_sufficient: row.evidence_sufficient.unwrap_or(0.0) > 0.5
+                && !evidence.is_empty(),
+            ambiguous: row.too_ambiguous.unwrap_or(0.0) > 0.5
+                || row.needs_human_review.unwrap_or(0.0) > 0.5,
+            confidence: confident,
+            vertical,
+            score: scored.score,
+            thresholds: config.thresholds.clone(),
+        });
+        sqlx::query(
+            "UPDATE leads SET score = ?, score_category = ?, qualification_status = ?, updated_at = ? \
+             WHERE tenant_id = ? AND id = ?",
+        )
+        .bind(scored.score)
+        .bind(scored.category.as_str())
+        .bind(qualification.status().as_str())
+        .bind(crate::domain::time::now_iso())
+        .bind(tenant_id)
+        .bind(&row.id)
+        .execute(&db.writer)
+        .await?;
+        let components = serde_json::to_value(&scored.components).unwrap_or(Value::Null);
+        let score_inputs = serde_json::to_value(&inputs).unwrap_or(Value::Null);
+        insert_score_history(
+            db,
+            &ScoreHistoryInsert {
+                lead_id: &row.id,
+                score_version: config.version,
+                score: scored.score,
+                category: scored.category.as_str(),
+                components: &components,
+                inputs: &score_inputs,
+                decision_run_id: row.decision_run_id.as_deref(),
+            },
+        )
+        .await?;
+        if row.score != Some(scored.score) {
+            outcome.updated += 1;
+        }
+    }
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, Default)]

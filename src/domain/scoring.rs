@@ -147,6 +147,25 @@ impl Default for ScoringConfig {
 }
 
 impl ScoringConfig {
+    /// Version 3 lowers the support and hospitality thresholds to 60.
+    ///
+    /// Real sample evidence: threads like "A Language Dilemma" (front desk) and "Bilingual
+    /// Spanish-English" (call centre) are genuine language-barrier work problems but scored 53-54,
+    /// below the old 65 threshold.
+    pub fn default_v3() -> Self {
+        let mut config = Self::default_v2();
+        config.version = 3;
+        config
+            .thresholds
+            .per_vertical
+            .insert(Vertical::CustomerSupport.as_str().to_string(), 60);
+        config
+            .thresholds
+            .per_vertical
+            .insert(Vertical::TourismHospitality.as_str().to_string(), 60);
+        config
+    }
+
     /// Version 2, calibrated on the first real Reddit sample. Rationale (versioned, auditable):
     ///
     /// - Product fit decides whether VoxTranslate can help at all, so it carries more weight than
@@ -465,6 +484,19 @@ mod tests {
             "score {} should clear the conference threshold",
             result.score
         );
+    }
+
+    #[test]
+    fn version_three_lowers_support_and_hospitality_thresholds() {
+        let config = ScoringConfig::default_v3();
+        config.validate().expect("valid");
+        assert_eq!(config.version, 3);
+        assert_eq!(config.threshold_for(Vertical::CustomerSupport), 60);
+        assert_eq!(config.threshold_for(Vertical::TourismHospitality), 60);
+        assert_eq!(config.threshold_for(Vertical::ConferencesWebinars), 50);
+        assert_eq!(config.threshold_for(Vertical::HrRecruiting), 65);
+        // Weights are unchanged from version 2.
+        assert_eq!(config.weights.product_fit, 25.0);
     }
 
     #[test]

@@ -43,6 +43,14 @@ fn vertical_keywords() -> Vec<(Vertical, Vec<&'static str>)> {
                 "cross-border recruitment",
                 "interview interpretation",
                 "international HR communication",
+                "language barrier",
+                "bilingual candidates",
+                "interpreter interview",
+                "translation interview",
+                "multilingual hiring",
+                "multilingual",
+                "bilingual",
+                "interpreter",
             ],
         ),
         (
@@ -58,6 +66,15 @@ fn vertical_keywords() -> Vec<(Vertical, Vec<&'static str>)> {
                 "global team communication",
                 "cross-language collaboration",
                 "multilingual business meetings",
+                "live translation",
+                "real-time translation",
+                "language barrier",
+                "multilingual team",
+                "interpreter meeting",
+                "translation tool",
+                "multilingual",
+                "bilingual",
+                "interpreter",
             ],
         ),
         (
@@ -73,6 +90,13 @@ fn vertical_keywords() -> Vec<(Vertical, Vec<&'static str>)> {
                 "conference streaming languages",
                 "multilingual events",
                 "international conference",
+                "live interpretation",
+                "interpretation service",
+                "multilingual event",
+                "live captions",
+                "event translation",
+                "multilingual",
+                "interpreter",
             ],
         ),
         (
@@ -87,6 +111,12 @@ fn vertical_keywords() -> Vec<(Vertical, Vec<&'static str>)> {
                 "cross-border customer experience",
                 "customer service interpretation",
                 "international support teams",
+                "language barrier",
+                "multilingual support",
+                "translation support",
+                "customer service translation",
+                "multilingual",
+                "bilingual",
             ],
         ),
         (
@@ -102,6 +132,13 @@ fn vertical_keywords() -> Vec<(Vertical, Vec<&'static str>)> {
                 "hotel customer service languages",
                 "multilingual hospitality",
                 "foreign tourists communication",
+                "language barrier",
+                "multilingual staff",
+                "guest translation",
+                "translation app",
+                "hotel guests language",
+                "multilingual",
+                "bilingual",
             ],
         ),
     ]
@@ -116,6 +153,9 @@ fn negative_keywords() -> Vec<&'static str> {
         "school assignments",
         "generic vocabulary questions",
         "unrelated language-learning discussions",
+        "translation studies",
+        "language exchange",
+        "translate this sentence",
     ]
 }
 
@@ -365,7 +405,13 @@ pub async fn seed_all(config: &AppConfig, db: &Db) -> anyhow::Result<SeedReport>
         .map_err(|error| anyhow::anyhow!("invalid historical scoring configuration: {error}"))?;
     qualification::save_scoring_version(db, &tenant_id, &historical, false).await?;
 
-    let scoring = ScoringConfig::default_v2();
+    let scoring_v2 = ScoringConfig::default_v2();
+    scoring_v2
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid scoring configuration v2: {error}"))?;
+    qualification::save_scoring_version(db, &tenant_id, &scoring_v2, false).await?;
+
+    let scoring = ScoringConfig::default_v3();
     scoring
         .validate()
         .map_err(|error| anyhow::anyhow!("invalid default scoring configuration: {error}"))?;

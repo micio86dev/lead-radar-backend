@@ -54,6 +54,15 @@ async fn main() -> anyhow::Result<()> {
             seed::reset_data(&db).await?;
             println!("database reset");
         }
+        Some("rescore") => {
+            let outcome = lead_radar::modules::qualification::rescore_tenant(
+                &db,
+                &config.default_tenant_id,
+                chrono::Utc::now(),
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&outcome)?);
+        }
         Some("token") => {
             let token = args.get(1).ok_or_else(|| {
                 anyhow::anyhow!("usage: db token <plaintext-token> (prints the stored hash)")
@@ -66,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
         }
         other => {
             anyhow::bail!(
-                "unknown command {other:?}; use migrate, seed, purge [days], reset --confirm, token <value>, settings"
+                "unknown command {other:?}; use migrate, seed, rescore, purge [days], reset --confirm, token <value>, settings"
             )
         }
     }
