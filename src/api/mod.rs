@@ -113,6 +113,10 @@ pub fn router(state: SharedState) -> Router {
             "/providers/benchmark",
             get(providers::list_benchmarks).post(providers::start_benchmark),
         )
+        .route(
+            "/providers/benchmark/dataset",
+            post(providers::ingest_benchmark_dataset),
+        )
         .route("/providers/benchmark/{id}", get(providers::get_benchmark))
         .route("/providers/{provider}/test", post(providers::test))
         // Import
@@ -228,6 +232,7 @@ pub async fn build_state(config: crate::config::AppConfig) -> anyhow::Result<Arc
         providers::usage,
         providers::decisions,
         providers::list_benchmarks,
+        providers::ingest_benchmark_dataset,
         providers::start_benchmark,
         providers::get_benchmark,
         providers::test,

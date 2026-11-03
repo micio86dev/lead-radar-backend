@@ -729,6 +729,55 @@ async fn counts(app: &common::TestApp) -> (i64, i64, i64, i64) {
 }
 
 #[tokio::test]
+async fn a_labeled_dataset_can_be_ingested_and_benchmarked() {
+    let app = setup().await;
+    let (status, body) = post(
+        &app,
+        "/api/v1/providers/benchmark/dataset",
+        json!({
+            "dataset": "operator-sample",
+            "items": [
+                {"external_ref": "s1", "text": "We cannot interview candidates who only speak Spanish. We need real-time translation, any suggestions?", "language": "en", "expected_relevant": true, "expected_intent": "explicit_solution_request", "expected_vertical": "hr_recruiting"},
+                {"external_ref": "s2", "text": "I need help with my translation homework for school.", "language": "en", "expected_relevant": false, "expected_intent": "irrelevant", "expected_vertical": "other"},
+                {"external_ref": "s3", "text": "Their support team cannot help customers who do not speak English, they need live translation.", "language": "en", "expected_relevant": true, "expected_intent": "active_problem", "expected_vertical": "customer_support", "split": "tuning"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stored"], 3);
+
+    let (status, body) = post(
+        &app,
+        "/api/v1/providers/benchmark",
+        json!({"dataset": "operator-sample", "providers": ["jev"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let run_id = body["benchmark_run_id"].as_str().expect("run id");
+    lead_radar::worker::drain(&app.state, 20)
+        .await
+        .expect("drain");
+
+    let (status, detail) = get(&app, &format!("/api/v1/providers/benchmark/{run_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["status"], "succeeded", "{detail}");
+    // Only the evaluation split is scored: the tuning example is excluded by design.
+    assert_eq!(detail["item_count"], 2);
+    let metrics = &detail["results"][0]["metrics"];
+    assert_eq!(metrics["count"], 2);
+
+    // Invalid labels are refused with field errors.
+    let (status, body) = post(
+        &app,
+        "/api/v1/providers/benchmark/dataset",
+        json!({"dataset": "bad", "items": [{"external_ref": "b1", "text": "x", "language": "en", "expected_relevant": true, "expected_intent": "nonsense", "expected_vertical": "hr_recruiting"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
 async fn jobs_can_be_retried_and_dead_letters_are_visible() {
     let app = setup_with("jev", "mock", "mock").await;
     let payload_post = relevant_post(&now_minus_hours(1));

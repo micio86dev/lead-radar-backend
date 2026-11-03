@@ -339,6 +339,129 @@ pub async fn test(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BenchmarkDatasetBody {
+    pub dataset: String,
+    pub items: Vec<BenchmarkItemBody>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BenchmarkItemBody {
+    pub external_ref: String,
+    pub text: String,
+    pub language: String,
+    pub expected_relevant: bool,
+    pub expected_intent: String,
+    pub expected_vertical: String,
+    #[serde(default)]
+    pub split: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/providers/benchmark/dataset", tag = "providers", responses((status = 200, description = "Labeled examples stored"), (status = 422, description = "Invalid dataset")))]
+pub async fn ingest_benchmark_dataset(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Json(body): Json<BenchmarkDatasetBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    let dataset = body.dataset.trim();
+    let mut errors = Vec::new();
+    if dataset.is_empty() || dataset.chars().count() > 64 {
+        errors.push(crate::error::FieldError::new(
+            "dataset",
+            "must be 1..=64 characters",
+        ));
+    }
+    if body.items.is_empty() || body.items.len() > 500 {
+        errors.push(crate::error::FieldError::new(
+            "items",
+            "between 1 and 500 labeled examples are required",
+        ));
+    }
+    for (index, item) in body.items.iter().enumerate() {
+        if item.external_ref.trim().is_empty() || item.external_ref.chars().count() > 128 {
+            errors.push(crate::error::FieldError::new(
+                format!("items[{index}].external_ref"),
+                "must be 1..=128 characters",
+            ));
+        }
+        if item.text.trim().is_empty() || item.text.chars().count() > 20_000 {
+            errors.push(crate::error::FieldError::new(
+                format!("items[{index}].text"),
+                "must be 1..=20000 characters",
+            ));
+        }
+        if item.language.trim().is_empty() || item.language.chars().count() > 16 {
+            errors.push(crate::error::FieldError::new(
+                format!("items[{index}].language"),
+                "must be a 1..=16 character language tag",
+            ));
+        }
+        if crate::domain::enums::Intent::parse(&item.expected_intent).is_none() {
+            errors.push(crate::error::FieldError::new(
+                format!("items[{index}].expected_intent"),
+                "unknown intent",
+            ));
+        }
+        if crate::domain::enums::Vertical::parse(&item.expected_vertical).is_none() {
+            errors.push(crate::error::FieldError::new(
+                format!("items[{index}].expected_vertical"),
+                "unknown vertical",
+            ));
+        }
+        if let Some(split) = &item.split {
+            if split != "tuning" && split != "evaluation" {
+                errors.push(crate::error::FieldError::new(
+                    format!("items[{index}].split"),
+                    "must be tuning or evaluation",
+                ));
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(AppError::Validation(errors));
+    }
+
+    let mut stored = 0usize;
+    for item in &body.items {
+        sqlx::query(
+            "INSERT INTO benchmark_items (id, tenant_id, dataset, external_ref, text, language, \
+             expected_relevant, expected_intent, expected_vertical, split, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(dataset, external_ref) DO UPDATE SET text = excluded.text, \
+             language = excluded.language, expected_relevant = excluded.expected_relevant, \
+             expected_intent = excluded.expected_intent, \
+             expected_vertical = excluded.expected_vertical, split = excluded.split",
+        )
+        .bind(crate::modules::new_id())
+        .bind(&context.tenant_id)
+        .bind(dataset)
+        .bind(item.external_ref.trim())
+        .bind(&item.text)
+        .bind(item.language.trim())
+        .bind(if item.expected_relevant { 1 } else { 0 })
+        .bind(&item.expected_intent)
+        .bind(&item.expected_vertical)
+        .bind(item.split.as_deref().unwrap_or("evaluation"))
+        .bind(crate::domain::time::now_iso())
+        .execute(&state.db.writer)
+        .await?;
+        stored += 1;
+    }
+
+    operations::audit(
+        &state.db,
+        &context.tenant_id,
+        &context.actor,
+        "benchmark_dataset_ingested",
+        "benchmark_dataset",
+        Some(dataset),
+        &json!({"items": stored}),
+    )
+    .await?;
+
+    Ok(Json(json!({"dataset": dataset, "stored": stored})))
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct BenchmarkQuery {
     #[serde(default)]
