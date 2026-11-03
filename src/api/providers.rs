@@ -19,10 +19,17 @@ struct ProviderStats {
     last_latency_ms: Option<i64>,
     last_error: Option<String>,
     last_status: Option<String>,
+    last_success_at: Option<String>,
+    last_error_at: Option<String>,
+    /// A recorded failure older than this window is history, not a current outage.
+    stale: bool,
     requests: i64,
     input_tokens: i64,
     output_tokens: i64,
 }
+
+/// An error recorded longer ago than this is reported as stale rather than as a current failure.
+const STALE_AFTER_HOURS: i64 = 24;
 
 async fn stats_for(state: &SharedState, tenant: &str, provider: &str) -> ProviderStats {
     let last: Option<(String, Option<i64>, Option<String>, String)> = sqlx::query_as(
@@ -44,11 +51,40 @@ async fn stats_for(state: &SharedState, tenant: &str, provider: &str) -> Provide
     .await
     .unwrap_or((0, 0, 0));
 
+    let last_success_at: Option<String> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM provider_usage \
+         WHERE tenant_id = ? AND provider = ? AND status = 'succeeded'",
+    )
+    .bind(tenant)
+    .bind(provider)
+    .fetch_one(&state.db.reader)
+    .await
+    .unwrap_or(None);
+    let last_error_at: Option<String> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM provider_usage \
+         WHERE tenant_id = ? AND provider = ? AND status = 'error'",
+    )
+    .bind(tenant)
+    .bind(provider)
+    .fetch_one(&state.db.reader)
+    .await
+    .unwrap_or(None);
+
+    let stale = last.as_ref().map(|row| row.3.as_str()) == Some("error")
+        && last
+            .as_ref()
+            .and_then(|row| crate::domain::time::parse_iso(&row.0))
+            .map(|when| (chrono::Utc::now() - when).num_hours() > STALE_AFTER_HOURS)
+            .unwrap_or(false);
+
     ProviderStats {
         last_request_at: last.as_ref().map(|row| row.0.clone()),
         last_latency_ms: last.as_ref().and_then(|row| row.1),
         last_error: last.as_ref().and_then(|row| row.2.clone()),
         last_status: last.as_ref().map(|row| row.3.clone()),
+        last_success_at,
+        last_error_at,
+        stale,
         requests: aggregates.0,
         input_tokens: aggregates.1,
         output_tokens: aggregates.2,
@@ -87,6 +123,9 @@ pub async fn provider_statuses(
         "last_request_at": jev_stats.last_request_at,
         "last_latency_ms": jev_stats.last_latency_ms,
         "last_error": jev_stats.last_error,
+        "last_success_at": jev_stats.last_success_at,
+        "last_error_at": jev_stats.last_error_at,
+        "stale": jev_stats.stale,
         "usage": {
             "requests": jev_stats.requests,
             "input_tokens": jev_stats.input_tokens,
@@ -107,6 +146,9 @@ pub async fn provider_statuses(
         "last_request_at": laya_stats.last_request_at,
         "last_latency_ms": laya_stats.last_latency_ms,
         "last_error": laya_stats.last_error,
+        "last_success_at": laya_stats.last_success_at,
+        "last_error_at": laya_stats.last_error_at,
+        "stale": laya_stats.stale,
         "usage": {
             "requests": laya_stats.requests,
             "input_tokens": laya_stats.input_tokens,
@@ -127,6 +169,9 @@ pub async fn provider_statuses(
         "last_request_at": qwen_stats.last_request_at,
         "last_latency_ms": qwen_stats.last_latency_ms,
         "last_error": qwen_stats.last_error,
+        "last_success_at": qwen_stats.last_success_at,
+        "last_error_at": qwen_stats.last_error_at,
+        "stale": qwen_stats.stale,
         "usage": {
             "requests": qwen_stats.requests,
             "input_tokens": qwen_stats.input_tokens,
@@ -147,6 +192,9 @@ pub async fn provider_statuses(
         "last_request_at": apify_stats.last_request_at,
         "last_latency_ms": apify_stats.last_latency_ms,
         "last_error": apify_stats.last_error,
+        "last_success_at": apify_stats.last_success_at,
+        "last_error_at": apify_stats.last_error_at,
+        "stale": apify_stats.stale,
         "usage": {
             "requests": apify_stats.requests,
             "input_tokens": apify_stats.input_tokens,

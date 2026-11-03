@@ -278,6 +278,57 @@ pub async fn patch_source(
     Ok(Json(json!(source)))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SourceValidationBody {
+    pub outcome: String,
+    pub evidence: String,
+    pub notes: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/sources/{id}/validate", tag = "sources", responses((status = 200, description = "Validation recorded"), (status = 422, description = "Evidence is required")))]
+pub async fn validate_source(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Path(id): Path<String>,
+    Json(body): Json<SourceValidationBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    let outcome = match body.outcome.as_str() {
+        "validated" => ValidationStatus::Validated,
+        "rejected" => ValidationStatus::Rejected,
+        other => {
+            return Err(AppError::Validation(vec![crate::error::FieldError::new(
+                "outcome",
+                format!("must be validated or rejected (got {other:?})"),
+            )]))
+        }
+    };
+    if body.evidence.trim().is_empty() {
+        return Err(AppError::Validation(vec![crate::error::FieldError::new(
+            "evidence",
+            "record what was verified and where",
+        )]));
+    }
+    let notes = match &body.notes {
+        Some(notes) => format!("{} — evidence: {}", notes, body.evidence.trim()),
+        None => format!("evidence: {}", body.evidence.trim()),
+    };
+    let source =
+        sources::validate_source(&state.db, &context.tenant_id, &id, outcome, Some(&notes))
+            .await?
+            .ok_or(AppError::NotFound)?;
+    operations::audit(
+        &state.db,
+        &context.tenant_id,
+        &context.actor,
+        "source_validated",
+        "source",
+        Some(&id),
+        &json!({"outcome": outcome.as_str(), "evidence": body.evidence}),
+    )
+    .await?;
+    Ok(Json(json!(source)))
+}
+
 #[utoipa::path(post, path = "/api/v1/sources/{id}/test", tag = "sources", responses((status = 200, description = "Provider reachability result")))]
 pub async fn test_source(
     State(state): State<SharedState>,

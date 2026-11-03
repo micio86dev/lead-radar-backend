@@ -65,6 +65,7 @@ pub async fn import_json(
         &state.db,
         tenant,
         Some(&source_id),
+        "manual_import",
         &body.posts,
         &context.actor,
         state.config.worker.max_attempts,

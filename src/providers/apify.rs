@@ -175,12 +175,12 @@ impl SourceProvider for ApifyProvider {
             map.entry("maxItems").or_insert(json!(request.max_items));
         }
         let path = format!("/v2/acts/{}/runs", request.actor_id);
-        let value = self
-            .post_json(
-                &path,
-                json!({ "input": input, "maxItems": request.max_items }),
-            )
-            .await?;
+        let mut body = json!({ "input": input, "maxItems": request.max_items });
+        if let Some(cap) = request.max_total_charge_usd {
+            // Enforced by Apify: a pay-per-event run cannot bill beyond this cap.
+            body["maxTotalChargeUsd"] = json!(cap);
+        }
+        let value = self.post_json(&path, body).await?;
         Ok(parse_run(&value))
     }
 
@@ -233,6 +233,7 @@ mod tests {
             max_concurrent_runs: 1,
             max_items_per_run: 10,
             max_run_cost_eur: 0.5,
+            max_total_charge_usd: 0.25,
             daily_budget_eur: 1.0,
             total_budget_eur: 25.0,
             kill_switch: false,
@@ -263,12 +264,40 @@ mod tests {
                 actor_id: "test~actor".to_string(),
                 input: json!({"query": "x"}),
                 max_items: 5,
+                max_total_charge_usd: Some(0.1),
             })
             .await
             .expect("start");
         assert_eq!(run.provider_run_id, "run-1");
         assert_eq!(run.status, RunStatus::Queued);
         assert_eq!(run.dataset_id.as_deref(), Some("dataset-1"));
+    }
+
+    #[tokio::test]
+    async fn the_run_carries_the_provider_side_charge_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/acts/test~actor/runs"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "data": {"id": "run-cap", "status": "READY", "defaultDatasetId": "dataset-cap"}
+            })))
+            .mount(&server)
+            .await;
+        provider(&server)
+            .start_run(&SourceRunRequest {
+                actor_id: "test~actor".to_string(),
+                input: json!({"search": "multilingual interviews"}),
+                max_items: 5,
+                max_total_charge_usd: Some(0.1),
+            })
+            .await
+            .expect("start");
+
+        let received = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+        assert_eq!(body["maxItems"], 5);
+        assert_eq!(body["maxTotalChargeUsd"], 0.1);
+        assert_eq!(body["input"]["search"], "multilingual interviews");
     }
 
     #[tokio::test]
@@ -319,6 +348,7 @@ mod tests {
             max_concurrent_runs: 1,
             max_items_per_run: 10,
             max_run_cost_eur: 0.5,
+            max_total_charge_usd: 0.25,
             daily_budget_eur: 1.0,
             total_budget_eur: 25.0,
             kill_switch: false,
@@ -332,6 +362,7 @@ mod tests {
                 actor_id: "a".to_string(),
                 input: json!({}),
                 max_items: 1,
+                max_total_charge_usd: None,
             })
             .await
             .expect_err("must fail");

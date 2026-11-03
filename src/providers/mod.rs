@@ -204,6 +204,8 @@ pub struct SourceRunRequest {
     pub actor_id: String,
     pub input: serde_json::Value,
     pub max_items: i64,
+    /// Provider-side hard cap for this run, in the provider's currency (Apify: USD).
+    pub max_total_charge_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

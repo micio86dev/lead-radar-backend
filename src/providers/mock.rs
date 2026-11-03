@@ -649,6 +649,7 @@ mod tests {
                 actor_id: "mock-actor".to_string(),
                 input: json!({}),
                 max_items: 10,
+                max_total_charge_usd: None,
             })
             .await
             .expect("start");

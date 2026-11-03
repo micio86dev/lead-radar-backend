@@ -83,6 +83,7 @@ pub fn router(state: SharedState) -> Router {
             get(directory::list_sources).post(directory::create_source),
         )
         .route("/sources/{id}", patch(directory::patch_source))
+        .route("/sources/{id}/validate", post(directory::validate_source))
         .route("/sources/{id}/test", post(directory::test_source))
         // Apify
         .route(
@@ -204,6 +205,7 @@ pub async fn build_state(config: crate::config::AppConfig) -> anyhow::Result<Arc
         directory::list_sources,
         directory::create_source,
         directory::patch_source,
+        directory::validate_source,
         directory::test_source,
         apify::list_actors,
         apify::create_actor,

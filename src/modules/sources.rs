@@ -492,6 +492,8 @@ pub struct Actor {
     pub input_template: Value,
     pub max_items_per_run: i64,
     pub cost_per_run_estimate: Option<f64>,
+    /// Provider-side per-run cap in USD, passed to Apify as `maxTotalChargeUsd`.
+    pub max_total_charge_usd: Option<f64>,
     pub last_success_at: Option<String>,
     pub created_at: String,
 }
@@ -509,6 +511,7 @@ struct ActorRow {
     input_template: String,
     max_items_per_run: i64,
     cost_per_run_estimate: Option<f64>,
+    max_total_charge_usd: Option<f64>,
     last_success_at: Option<String>,
     created_at: String,
 }
@@ -527,6 +530,7 @@ impl From<ActorRow> for Actor {
             input_template: from_json_or(&row.input_template, Value::Object(Default::default())),
             max_items_per_run: row.max_items_per_run,
             cost_per_run_estimate: row.cost_per_run_estimate,
+            max_total_charge_usd: row.max_total_charge_usd,
             last_success_at: row.last_success_at,
             created_at: row.created_at,
         }
@@ -562,6 +566,7 @@ pub struct NewActor<'a> {
     pub input_template: &'a Value,
     pub max_items_per_run: i64,
     pub cost_per_run_estimate: Option<f64>,
+    pub max_total_charge_usd: Option<f64>,
 }
 
 /// The Actor id is stored exactly as supplied: validation is a human step, never a guess.
@@ -575,8 +580,8 @@ pub async fn create_actor(
     sqlx::query(
         "INSERT INTO actor_registry (id, tenant_id, provider, actor_id, name, description, \
          source_type, enabled, validation_status, input_template, max_items_per_run, \
-         cost_per_run_estimate, created_at, updated_at) \
-         VALUES (?, ?, 'apify', ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?)",
+         cost_per_run_estimate, max_total_charge_usd, created_at, updated_at) \
+         VALUES (?, ?, 'apify', ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(tenant_id)
@@ -587,6 +592,7 @@ pub async fn create_actor(
     .bind(to_json(input.input_template))
     .bind(input.max_items_per_run.max(1))
     .bind(input.cost_per_run_estimate)
+    .bind(input.max_total_charge_usd)
     .bind(&now)
     .bind(&now)
     .execute(&db.writer)
@@ -625,6 +631,7 @@ pub struct ActorPatch<'a> {
     pub validation_status: Option<ValidationStatus>,
     pub description: Option<&'a str>,
     pub max_items_per_run: Option<i64>,
+    pub max_total_charge_usd: Option<f64>,
     pub input_template: Option<&'a Value>,
 }
 
@@ -679,6 +686,18 @@ pub async fn update_actor(
         .execute(&db.writer)
         .await?;
     }
+    if let Some(cap) = patch.max_total_charge_usd {
+        sqlx::query(
+            "UPDATE actor_registry SET max_total_charge_usd = ?, updated_at = ? \
+             WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(cap)
+        .bind(&now)
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
     if let Some(template) = patch.input_template {
         sqlx::query(
             "UPDATE actor_registry SET input_template = ?, updated_at = ?              WHERE id = ? AND tenant_id = ?",
@@ -715,6 +734,7 @@ pub struct Source {
     pub source_type: String,
     pub enabled: bool,
     pub validation_status: String,
+    pub notes: Option<String>,
     pub config: Value,
     pub last_run_at: Option<String>,
     pub created_at: String,
@@ -728,6 +748,7 @@ struct SourceRow {
     source_type: String,
     enabled: i64,
     validation_status: String,
+    notes: Option<String>,
     config: String,
     last_run_at: Option<String>,
     created_at: String,
@@ -742,6 +763,7 @@ impl From<SourceRow> for Source {
             source_type: row.source_type,
             enabled: row.enabled != 0,
             validation_status: row.validation_status,
+            notes: row.notes,
             config: from_json_or(&row.config, Value::Object(Default::default())),
             last_run_at: row.last_run_at,
             created_at: row.created_at,
@@ -751,8 +773,8 @@ impl From<SourceRow> for Source {
 
 pub async fn list_sources(db: &Db, tenant_id: &str) -> Result<Vec<Source>, sqlx::Error> {
     let rows = sqlx::query_as::<_, SourceRow>(
-        "SELECT id, name, provider, source_type, enabled, validation_status, config, last_run_at, \
-         created_at FROM sources WHERE tenant_id = ? ORDER BY name",
+        "SELECT id, name, provider, source_type, enabled, validation_status, notes, config, \
+         last_run_at, created_at FROM sources WHERE tenant_id = ? ORDER BY name",
     )
     .bind(tenant_id)
     .fetch_all(&db.reader)
@@ -762,8 +784,8 @@ pub async fn list_sources(db: &Db, tenant_id: &str) -> Result<Vec<Source>, sqlx:
 
 pub async fn get_source(db: &Db, tenant_id: &str, id: &str) -> Result<Option<Source>, sqlx::Error> {
     let row = sqlx::query_as::<_, SourceRow>(
-        "SELECT id, name, provider, source_type, enabled, validation_status, config, last_run_at, \
-         created_at FROM sources WHERE tenant_id = ? AND id = ?",
+        "SELECT id, name, provider, source_type, enabled, validation_status, notes, config, \
+         last_run_at, created_at FROM sources WHERE tenant_id = ? AND id = ?",
     )
     .bind(tenant_id)
     .bind(id)
@@ -778,8 +800,8 @@ pub async fn find_source_by_name(
     name: &str,
 ) -> Result<Option<Source>, sqlx::Error> {
     let row = sqlx::query_as::<_, SourceRow>(
-        "SELECT id, name, provider, source_type, enabled, validation_status, config, last_run_at, \
-         created_at FROM sources WHERE tenant_id = ? AND name = ?",
+        "SELECT id, name, provider, source_type, enabled, validation_status, notes, config, \
+         last_run_at, created_at FROM sources WHERE tenant_id = ? AND name = ?",
     )
     .bind(tenant_id)
     .bind(name)
@@ -852,6 +874,32 @@ pub async fn patch_source(
             .bind(tenant_id)
             .execute(&db.writer)
             .await?;
+    }
+    get_source(db, tenant_id, id).await
+}
+
+/// Record a validation outcome for a source. Enabling stays a separate, explicit step.
+pub async fn validate_source(
+    db: &Db,
+    tenant_id: &str,
+    id: &str,
+    outcome: ValidationStatus,
+    notes: Option<&str>,
+) -> Result<Option<Source>, sqlx::Error> {
+    let now = now_iso();
+    let updated = sqlx::query(
+        "UPDATE sources SET validation_status = ?, notes = COALESCE(?, notes), updated_at = ? \
+         WHERE id = ? AND tenant_id = ?",
+    )
+    .bind(outcome.as_str())
+    .bind(notes)
+    .bind(&now)
+    .bind(id)
+    .bind(tenant_id)
+    .execute(&db.writer)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(None);
     }
     get_source(db, tenant_id, id).await
 }

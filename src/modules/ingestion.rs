@@ -128,42 +128,63 @@ fn normalize_language(language: Option<&str>, content: &str) -> String {
     }
 }
 
-/// Ensure the default manual import source exists and is usable.
-pub async fn ensure_manual_source(db: &Db, tenant_id: &str) -> Result<String, sqlx::Error> {
-    if let Some(source) =
-        crate::modules::sources::find_source_by_name(db, tenant_id, "manual-import").await?
-    {
+/// Ensure a source row exists, returning its id. Used to attach provenance to ingested posts.
+pub async fn ensure_source(
+    db: &Db,
+    tenant_id: &str,
+    name: &str,
+    provider: &str,
+    source_type: &str,
+    note: &str,
+) -> Result<String, sqlx::Error> {
+    if let Some(source) = crate::modules::sources::find_source_by_name(db, tenant_id, name).await? {
         return Ok(source.id);
     }
     let source = crate::modules::sources::create_source(
         db,
         tenant_id,
         &crate::modules::sources::NewSource {
-            name: "manual-import",
-            provider: "manual_import",
-            source_type: "manual_json",
-            config: &serde_json::json!({"note": "operator supplied JSON"}),
-        },
-    )
-    .await?;
-    crate::modules::sources::patch_source(
-        db,
-        tenant_id,
-        &source.id,
-        &crate::modules::sources::SourcePatch {
-            enabled: Some(true),
-            config: None,
+            name,
+            provider,
+            source_type,
+            config: &serde_json::json!({ "note": note }),
         },
     )
     .await?;
     Ok(source.id)
 }
 
+/// Ensure the default manual import source exists and is usable.
+pub async fn ensure_manual_source(db: &Db, tenant_id: &str) -> Result<String, sqlx::Error> {
+    let id = ensure_source(
+        db,
+        tenant_id,
+        "manual-import",
+        "manual_import",
+        "manual_json",
+        "operator supplied JSON",
+    )
+    .await?;
+    crate::modules::sources::patch_source(
+        db,
+        tenant_id,
+        &id,
+        &crate::modules::sources::SourcePatch {
+            enabled: Some(true),
+            config: None,
+        },
+    )
+    .await?;
+    Ok(id)
+}
+
 /// Import posts and enqueue the pipeline. Duplicates are counted, not stored twice.
+#[allow(clippy::too_many_arguments)]
 pub async fn import_posts(
     db: &Db,
     tenant_id: &str,
     source_id: Option<&str>,
+    provider: &str,
     posts: &[ImportPost],
     requested_by: &str,
     max_attempts: i64,
@@ -255,10 +276,11 @@ pub async fn import_posts(
         if let Some(source_id) = source_id {
             sqlx::query(
                 "INSERT INTO post_sources (post_id, source_id, provider, first_seen_at) \
-                 VALUES (?, ?, 'ingest', ?) ON CONFLICT DO NOTHING",
+                 VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
             )
             .bind(&post_id)
             .bind(source_id)
+            .bind(provider)
             .bind(&now)
             .execute(&db.writer)
             .await?;
@@ -425,6 +447,33 @@ pub async fn run_post_ids(
     .await
 }
 
+/// Resolve the item URL. Dataset items often carry a relative permalink (`/r/…`); it is joined to the
+/// canonical host when the item also identifies a subreddit/community, and left empty rather than
+/// guessed for an unknown provider.
+pub fn absolute_url(item: &Value) -> Option<String> {
+    let raw = ["url", "permalink", "link"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_str))?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    if raw.starts_with('/')
+        && (item.get("subreddit").is_some()
+            || item.get("community").is_some()
+            || item.get("forum").is_some())
+    {
+        return Some(format!(
+            "https://www.reddit.com{}",
+            raw.trim_end_matches('/')
+        ));
+    }
+    None
+}
+
 /// Generic dataset mapping: documented aliases only, no Actor-specific assumptions.
 pub fn map_dataset_item(item: &Value) -> Option<ImportPost> {
     let content = ["content", "text", "body", "selftext", "description"]
@@ -440,7 +489,7 @@ pub fn map_dataset_item(item: &Value) -> Option<ImportPost> {
         external_id: string(&["id", "external_id", "url"]),
         title: string(&["title", "headline"]),
         content,
-        url: string(&["url", "permalink", "link"]),
+        url: absolute_url(item),
         author: string(&["author", "username", "user"]),
         community: string(&["community", "subreddit", "forum", "channel"]),
         language: string(&["language", "lang"]),
@@ -501,6 +550,29 @@ mod tests {
         assert_eq!(post.community.as_deref(), Some("recruiting"));
         assert_eq!(post.engagement.as_ref().expect("engagement").upvotes, 7);
         assert!(map_dataset_item(&serde_json::json!({"title": "no body"})).is_none());
+    }
+
+    #[test]
+    fn relative_permalinks_are_resolved_and_unknown_hosts_are_not_invented() {
+        let reddit = serde_json::json!({
+            "text": "body",
+            "permalink": "/r/recruiting/comments/abc/multilingual_interviews/",
+            "subreddit": "recruiting"
+        });
+        assert_eq!(
+            map_dataset_item(&reddit).expect("mapped").url.as_deref(),
+            Some("https://www.reddit.com/r/recruiting/comments/abc/multilingual_interviews")
+        );
+
+        let absolute = serde_json::json!({"text": "body", "url": "https://example.invalid/p/1"});
+        assert_eq!(
+            map_dataset_item(&absolute).expect("mapped").url.as_deref(),
+            Some("https://example.invalid/p/1")
+        );
+
+        // A relative path with no host hint stays empty instead of being guessed.
+        let unknown = serde_json::json!({"text": "body", "url": "/p/1"});
+        assert_eq!(map_dataset_item(&unknown).expect("mapped").url, None);
     }
 
     #[test]

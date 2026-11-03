@@ -38,6 +38,7 @@ pub struct NewActorBody {
     pub input_template: serde_json::Value,
     pub max_items_per_run: Option<i64>,
     pub max_run_cost_eur: Option<f64>,
+    pub max_total_charge_usd: Option<f64>,
 }
 
 #[utoipa::path(post, path = "/api/v1/providers/apify/actors", tag = "apify", responses((status = 201, description = "Actor registered disabled and pending validation"), (status = 422, description = "Invalid input")))]
@@ -71,6 +72,10 @@ pub async fn create_actor(
             input_template: &body.input_template,
             max_items_per_run: max_items,
             cost_per_run_estimate: body.max_run_cost_eur,
+            max_total_charge_usd: Some(
+                body.max_total_charge_usd
+                    .unwrap_or(state.config.apify.max_total_charge_usd),
+            ),
         },
     )
     .await?;
@@ -93,6 +98,7 @@ pub struct ActorPatchBody {
     pub validation_status: Option<String>,
     pub description: Option<String>,
     pub max_items_per_run: Option<i64>,
+    pub max_total_charge_usd: Option<f64>,
     pub input_template: Option<serde_json::Value>,
 }
 
@@ -144,6 +150,7 @@ pub async fn patch_actor(
             validation_status: validation,
             description: body.description.as_deref(),
             max_items_per_run: body.max_items_per_run,
+            max_total_charge_usd: body.max_total_charge_usd,
             input_template: body.input_template.as_ref(),
         },
     )

@@ -531,6 +531,11 @@ async fn poll_actor_run(state: &AppState, job: &JobRow) -> Result<JobOutcome, Jo
             actor_id: actor.actor_id.clone(),
             input: input.get("input").cloned().unwrap_or_else(|| json!({})),
             max_items: items_limit,
+            max_total_charge_usd: Some(
+                actor
+                    .max_total_charge_usd
+                    .unwrap_or(state.config.apify.max_total_charge_usd),
+            ),
         };
         match state.providers.source.start_run(&request).await {
             Ok(provider_run) => {
@@ -676,10 +681,21 @@ async fn ingest_dataset(state: &AppState, job: &JobRow) -> Result<JobOutcome, Jo
         .iter()
         .filter_map(ingestion::map_dataset_item)
         .collect();
+    // Attach provenance: the default Apify source row records where these posts came from.
+    let source_id = ingestion::ensure_source(
+        &state.db,
+        tenant_id,
+        "apify-default",
+        "apify",
+        "community_feed",
+        "posts collected by a validated Actor",
+    )
+    .await?;
     let outcome = ingestion::import_posts(
         &state.db,
         tenant_id,
-        None,
+        Some(&source_id),
+        "apify",
         &posts,
         "system:worker",
         state.config.worker.max_attempts,

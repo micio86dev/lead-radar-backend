@@ -236,6 +236,10 @@ async fn unconfigured_decision_provider_fails_visibly_and_creates_no_lead() {
         .find(|provider| provider["provider"] == "jev")
         .expect("jev status");
     assert_eq!(jev["status"], "unconfigured");
+    // A failure is not reported as stale while it is recent, and no success was ever recorded.
+    assert_eq!(jev["stale"], false);
+    assert_eq!(jev["last_success_at"], serde_json::Value::Null);
+    assert!(jev.get("last_error_at").is_some());
 }
 
 #[tokio::test]
@@ -365,6 +369,75 @@ async fn communities_and_sources_cannot_be_enabled_without_validation() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["enabled"], true);
+}
+
+#[tokio::test]
+async fn sources_require_recorded_validation_before_enabling() {
+    let app = setup().await;
+    let (status, body) = get(&app, "/api/v1/sources").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let source = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|source| source["name"] == "apify-default")
+        .expect("seeded apify source")
+        .clone();
+    let id = source["id"].as_str().expect("id").to_string();
+    assert_eq!(source["enabled"], false);
+
+    // Enabling without validation is refused.
+    let (status, body) = patch(
+        &app,
+        &format!("/api/v1/sources/{id}"),
+        json!({"enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("source_not_validated:"));
+
+    // Evidence is mandatory.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/sources/{id}/validate"),
+        json!({"outcome": "validated", "evidence": "   "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/sources/{id}/validate"),
+        json!({
+            "outcome": "validated",
+            "evidence": "operator relevance review; collection through an authorized Actor",
+            "notes": "relevance review"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["validation_status"], "validated");
+    assert!(body["notes"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("authorized Actor"));
+
+    let (status, body) = patch(
+        &app,
+        &format!("/api/v1/sources/{id}"),
+        json!({"enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], true);
+
+    // The reachability probe reports the adapter state; it never fabricates a success.
+    let (status, body) = post(&app, &format!("/api/v1/sources/{id}/test"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ok");
 }
 
 #[tokio::test]
