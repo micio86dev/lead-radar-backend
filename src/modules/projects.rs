@@ -101,6 +101,60 @@ pub async fn list_projects(db: &Db, tenant_id: &str) -> Result<Vec<Project>, sql
     .await
 }
 
+/// Projects with their stored ranking, for the page that lists them.
+pub async fn list_with_matches(
+    db: &Db,
+    tenant_id: &str,
+) -> Result<Vec<(Project, Vec<CommunityMatch>)>, sqlx::Error> {
+    let projects = list_projects(db, tenant_id).await?;
+    let rows = sqlx::query_as::<_, ProjectMatchRow>(
+        "SELECT pc.project_id, c.id AS community_id, c.name, c.vertical, c.enabled, \
+                pc.relevance, pc.reason, pc.matched_at \
+         FROM project_communities pc \
+         JOIN communities c ON c.id = pc.community_id \
+         JOIN projects p ON p.id = pc.project_id \
+         WHERE p.tenant_id = ? \
+         ORDER BY pc.relevance DESC, c.name",
+    )
+    .bind(tenant_id)
+    .fetch_all(&db.reader)
+    .await?;
+    let mut grouped: std::collections::BTreeMap<String, Vec<CommunityMatch>> = Default::default();
+    for row in rows {
+        grouped
+            .entry(row.project_id.clone())
+            .or_default()
+            .push(CommunityMatch::from(CommunityMatchRow {
+                community_id: row.community_id,
+                name: row.name,
+                vertical: row.vertical,
+                enabled: row.enabled,
+                relevance: row.relevance,
+                reason: row.reason,
+                matched_at: row.matched_at,
+            }));
+    }
+    Ok(projects
+        .into_iter()
+        .map(|project| {
+            let matches = grouped.remove(&project.id).unwrap_or_default();
+            (project, matches)
+        })
+        .collect())
+}
+
+#[derive(FromRow)]
+struct ProjectMatchRow {
+    project_id: String,
+    community_id: String,
+    name: String,
+    vertical: String,
+    enabled: i64,
+    relevance: i64,
+    reason: String,
+    matched_at: String,
+}
+
 pub async fn get_project(
     db: &Db,
     tenant_id: &str,
@@ -298,6 +352,34 @@ impl From<CommunityMatchRow> for CommunityMatch {
     }
 }
 
+/// Which provider answers the ranking question. The generative one reads the whole candidate list in
+/// one call and explains each score; the decision provider answers one probability per community and
+/// costs one call per community, with no prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scorer {
+    Generative,
+    Decision,
+}
+
+impl Scorer {
+    pub fn parse(raw: &str) -> Result<Self, ProjectError> {
+        match raw.trim() {
+            "" | "generative" | "qwen" => Ok(Self::Generative),
+            "decision" | "jev" => Ok(Self::Decision),
+            other => Err(ProjectError::Invalid(format!(
+                "unknown scorer {other:?}: use generative or decision"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Generative => "generative",
+            Self::Decision => "decision",
+        }
+    }
+}
+
 pub struct AnalysisOutcome {
     pub project_id: String,
     pub candidates: usize,
@@ -305,6 +387,7 @@ pub struct AnalysisOutcome {
     pub pages: Vec<FetchOutcome>,
     pub provider: String,
     pub model: String,
+    pub scorer: Scorer,
 }
 
 /// Rank the communities that are already validated and enabled against the project material.
@@ -315,6 +398,7 @@ pub async fn analyze_communities(
     state: &AppState,
     tenant_id: &str,
     project_id: &str,
+    scorer: Scorer,
 ) -> Result<AnalysisOutcome, ProjectError> {
     let project = get_project(&state.db, tenant_id, project_id)
         .await?
@@ -344,6 +428,10 @@ pub async fn analyze_communities(
         .map(|(url, text)| format!("--- {url} ---\n{text}"))
         .collect::<Vec<_>>()
         .join("\n\n");
+
+    if scorer == Scorer::Decision {
+        return analyze_with_decision(state, tenant_id, &project, &candidates, &page_text).await;
+    }
 
     let candidate_list = candidates
         .iter()
@@ -414,6 +502,98 @@ the problem this product solves? Answer with JSON only.";
         pages,
         provider: result.provider,
         model: result.model,
+        scorer,
+    })
+}
+
+/// One decision call per candidate: a probability, no prose. Chosen when the operator prefers the
+/// decision provider's calibration over a generative explanation.
+async fn analyze_with_decision(
+    state: &AppState,
+    tenant_id: &str,
+    project: &Project,
+    candidates: &[(String, String, String)],
+    page_text: &str,
+) -> Result<AnalysisOutcome, ProjectError> {
+    let question = crate::domain::decision::DecisionQuestion {
+        id: "community_fit".to_string(),
+        kind: crate::domain::decision::QuestionKind::Noul,
+        instructions: "Probability that the people in this community discuss the problem the \
+                       product solves. Judge topical fit only."
+            .to_string(),
+        criteria: None,
+    };
+    let mut parsed: Vec<(String, i64, String)> = Vec::new();
+    let mut provider = String::from("decision");
+    let mut model = String::new();
+    for (id, name, vertical) in candidates {
+        let request = crate::providers::DecisionRequest {
+            state: format!(
+                "PRODUCT: {name}\n{summary}\n\nWEBSITE:\n{website}\n\nCOMMUNITY: r/{community} \
+                 ({vertical})",
+                name = project.name,
+                summary = project.prompt_context(),
+                website = if page_text.is_empty() {
+                    "not read"
+                } else {
+                    page_text
+                },
+                community = name,
+                vertical = vertical,
+            ),
+            questions: vec![crate::domain::decision::DecisionQuestion {
+                id: question.id.clone(),
+                kind: question.kind,
+                instructions: question.instructions.clone(),
+                criteria: None,
+            }],
+            idempotency_key: Some(format!("project-fit:{}-{id}", project.id)),
+        };
+        let result = state.providers.decision.evaluate(&request).await?;
+        provider = result.provider.clone();
+        model = result.model.clone();
+        let probability = result.noul("community_fit").unwrap_or(0.0).clamp(0.0, 1.0);
+        parsed.push((
+            id.clone(),
+            (probability * 100.0).round() as i64,
+            format!("probability {probability:.2} that this community discusses the problem"),
+        ));
+        operations::record_usage(
+            &state.db,
+            Some(tenant_id),
+            &operations::UsageRecord {
+                provider: &result.provider,
+                operation: "project_community_match",
+                request_id: result.provider_request_id.as_deref(),
+                input_tokens: result.usage.input_tokens,
+                output_tokens: result.usage.output_tokens,
+                latency_ms: Some(result.latency_ms),
+                status: "succeeded",
+                error: None,
+            },
+        )
+        .await?;
+    }
+    parsed.sort_by(|left, right| right.1.cmp(&left.1));
+    store_matches(&state.db, &project.id, &parsed).await?;
+    operations::audit(
+        &state.db,
+        tenant_id,
+        "system:match",
+        "project_communities_matched",
+        "project",
+        Some(&project.id),
+        &json!({"candidates": candidates.len(), "matched": parsed.len(), "scorer": "decision"}),
+    )
+    .await?;
+    Ok(AnalysisOutcome {
+        project_id: project.id.clone(),
+        candidates: candidates.len(),
+        matched: parsed.len(),
+        pages: Vec::new(),
+        provider,
+        model,
+        scorer: Scorer::Decision,
     })
 }
 

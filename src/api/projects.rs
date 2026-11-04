@@ -1,6 +1,6 @@
 //! Projects: the product a tenant works on, and the community ranking computed from it.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -47,8 +47,25 @@ pub async fn list(
     State(state): State<SharedState>,
     context: TenantContext,
 ) -> AppResult<Json<serde_json::Value>> {
-    let items = projects::list_projects(&state.db, &context.tenant_id).await?;
-    let body = items.iter().map(project_json).collect::<Vec<_>>();
+    let items = projects::list_with_matches(&state.db, &context.tenant_id).await?;
+    let body = items
+        .into_iter()
+        .map(|(project, matches)| {
+            let mut body = project_json(&project);
+            body["matched"] = json!(matches.len());
+            // The card shows the head of the ranking and how fresh it is, not the whole table.
+            body["top_communities"] = json!(matches
+                .iter()
+                .take(3)
+                .map(|matched| json!({
+                    "name": matched.name,
+                    "relevance": matched.relevance,
+                }))
+                .collect::<Vec<_>>());
+            body["matched_at"] = json!(matches.first().map(|matched| matched.matched_at.clone()));
+            body
+        })
+        .collect::<Vec<_>>();
     Ok(Json(json!({ "items": body, "total": body.len() })))
 }
 
@@ -143,13 +160,24 @@ pub async fn remove(
     }
 }
 
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct MatchQuery {
+    /// generative (default, one call, explains each score) or decision (one call per community,
+    /// a probability and no prose).
+    #[serde(default)]
+    pub scorer: Option<String>,
+}
+
 #[utoipa::path(post, path = "/api/v1/projects/{id}/match-communities", tag = "projects", responses((status = 200, description = "Community ranking stored"), (status = 409, description = "No candidate community"), (status = 502, description = "Provider failure")))]
 pub async fn match_communities(
     State(state): State<SharedState>,
     context: TenantContext,
     Path(id): Path<String>,
+    Query(query): Query<MatchQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let outcome = projects::analyze_communities(&state, &context.tenant_id, &id)
+    let scorer =
+        projects::Scorer::parse(query.scorer.as_deref().unwrap_or("")).map_err(map_error)?;
+    let outcome = projects::analyze_communities(&state, &context.tenant_id, &id, scorer)
         .await
         .map_err(map_error)?;
     let matches = projects::project_matches(&state.db, &context.tenant_id, &id).await?;
@@ -159,6 +187,7 @@ pub async fn match_communities(
         "matched": outcome.matched,
         "provider": outcome.provider,
         "model": outcome.model,
+        "scorer": outcome.scorer.as_str(),
         "pages": outcome.pages.iter().map(|page| json!({
             "url": page.url,
             "read": page.text.is_some(),

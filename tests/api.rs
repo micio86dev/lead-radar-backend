@@ -1018,6 +1018,7 @@ async fn a_project_ranks_only_the_communities_that_are_validated_and_enabled() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["candidates"], 1, "{body}");
+    assert_eq!(body["scorer"], "generative", "{body}");
     let ranked = body["communities"].as_array().expect("matches");
     assert_eq!(ranked.len(), 1, "{body}");
     assert_eq!(ranked[0]["name"], "humanresources");
@@ -1044,6 +1045,87 @@ async fn a_project_ranks_only_the_communities_that_are_validated_and_enabled() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[tokio::test]
+async fn the_decision_provider_can_rank_a_project_without_prose() {
+    let app = setup().await;
+    let (_, communities) = get(&app, "/api/v1/communities?per_page=100").await;
+    let community_id = communities["items"][0]["id"]
+        .as_str()
+        .expect("community id")
+        .to_string();
+    let (status, _) = post(
+        &app,
+        &format!("/api/v1/communities/{community_id}/validate"),
+        json!({"outcome": "validated", "evidence": "rules read"}),
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, _) = patch(
+        &app,
+        &format!("/api/v1/communities/{community_id}"),
+        json!({"enabled": true}),
+    )
+    .await;
+    assert!(status.is_success());
+
+    let (_, project) = post(
+        &app,
+        "/api/v1/projects",
+        json!({"name": "Decision ranked", "summary": "Voice translation for international teams."}),
+    )
+    .await;
+    let project_id = project["id"].as_str().expect("id").to_string();
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/projects/{project_id}/match-communities?scorer=decision"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["scorer"], "decision", "{body}");
+    assert_eq!(body["provider"], "mock", "{body}");
+    let ranked = body["communities"].as_array().expect("ranking");
+    assert_eq!(ranked.len(), 1, "{body}");
+    // A probability, not prose: 0.72 from the mock decision provider becomes 72.
+    assert_eq!(ranked[0]["relevance"], 72, "{body}");
+    assert!(
+        ranked[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("probability 0.72"),
+        "{body}"
+    );
+
+    // An unknown scorer is a validation error, never a silent default.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/projects/{project_id}/match-communities?scorer=oracle"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn the_project_list_carries_the_head_of_its_ranking() {
+    let app = setup().await;
+    let (_, projects) = get(&app, "/api/v1/projects").await;
+    let project = projects["items"]
+        .as_array()
+        .expect("projects")
+        .first()
+        .expect("seeded default project")
+        .clone();
+    // The seeded default has no ranking yet: the card shows that honestly.
+    assert_eq!(project["matched"], 0, "{project}");
+    assert!(project["top_communities"]
+        .as_array()
+        .expect("top")
+        .is_empty());
+    assert!(project["matched_at"].is_null(), "{project}");
 }
 
 #[tokio::test]

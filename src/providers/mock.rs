@@ -344,7 +344,7 @@ impl DecisionProvider for MockDecisionProvider {
     async fn evaluate(&self, request: &DecisionRequest) -> Result<DecisionResult, ProviderError> {
         validate_request(&request.state, &request.questions)
             .map_err(ProviderError::InvalidRequest)?;
-        let answers = classify(&request.state)
+        let mut answers: Vec<DecisionAnswer> = classify(&request.state)
             .into_iter()
             .filter(|answer| {
                 request
@@ -353,6 +353,23 @@ impl DecisionProvider for MockDecisionProvider {
                     .any(|question| question.id == answer.question)
             })
             .collect();
+        // A community-fit question is not part of the lead schema: answer it deterministically so
+        // the decision-backed project matching is testable offline.
+        for question in &request.questions {
+            if question.id == "community_fit" && !answers.iter().any(|a| a.question == question.id)
+            {
+                answers.push(DecisionAnswer {
+                    question: question.id.clone(),
+                    kind: question.kind,
+                    noul: Some(0.72),
+                    choice: None,
+                    score: None,
+                    legend: None,
+                    probabilities: None,
+                    confidence: Some(0.44),
+                });
+            }
+        }
         Ok(DecisionResult {
             provider: "mock".to_string(),
             model: "mock".to_string(),
