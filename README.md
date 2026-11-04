@@ -34,3 +34,8 @@ cargo test --all-targets
 `src/api` (HTTP), `src/modules` (domain modules with SQL), `src/domain` (pure logic),
 `src/providers` (external adapters behind traits), `src/worker` (job handlers), `migrations/`
 (versioned SQL). Rules and conventions: `AGENTS.md`. Architecture: `../docs/architecture.md`.
+
+## License
+
+PolyForm Noncommercial License 1.0.0 (see `LICENSE`). Noncommercial use is free; commercial use needs a
+paid license, described in the root repository's `COMMERCIAL.md`.
