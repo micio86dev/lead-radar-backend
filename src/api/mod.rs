@@ -8,6 +8,7 @@ mod imports;
 mod operations;
 mod opportunities;
 mod profiles;
+mod projects;
 mod providers;
 mod system;
 
@@ -128,6 +129,18 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/providers/apify/usage", get(apify::usage))
         // Providers
+        // Projects
+        .route("/projects", get(projects::list).post(projects::create))
+        .route(
+            "/projects/{id}",
+            get(projects::detail)
+                .patch(projects::patch)
+                .delete(projects::remove),
+        )
+        .route(
+            "/projects/{id}/match-communities",
+            post(projects::match_communities),
+        )
         .route("/providers", get(providers::list))
         .route("/providers/usage", get(providers::usage))
         .route("/providers/decisions", get(providers::decisions))
@@ -248,6 +261,12 @@ pub async fn build_state(config: crate::config::AppConfig) -> anyhow::Result<Arc
         directory::patch_source,
         directory::validate_source,
         directory::test_source,
+        projects::list,
+        projects::create,
+        projects::detail,
+        projects::patch,
+        projects::remove,
+        projects::match_communities,
         apify::list_actors,
         apify::create_actor,
         apify::patch_actor,

@@ -11,5 +11,6 @@ pub mod language;
 pub mod qualification;
 pub mod scoring;
 pub mod time;
+pub mod webfetch;
 
 pub use enums::*;

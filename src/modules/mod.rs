@@ -7,6 +7,7 @@ pub mod engagement;
 pub mod generative;
 pub mod ingestion;
 pub mod operations;
+pub mod projects;
 pub mod qualification;
 pub mod replies;
 pub mod sources;
