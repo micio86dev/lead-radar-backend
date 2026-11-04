@@ -454,7 +454,9 @@ fn parse_matches(
             .chars()
             .take(400)
             .collect::<String>();
-        parsed.push((id.clone(), relevance, format!("{canonical}: {reason}")));
+        // The table already shows the community name; repeating it in every reason is noise.
+        let _ = canonical;
+        parsed.push((id.clone(), relevance, reason));
     }
     if parsed.is_empty() {
         return Err(ProjectError::Unusable(
