@@ -43,6 +43,15 @@ pub fn router(state: SharedState) -> Router {
             post(opportunities::prepare_drafts),
         )
         .route(
+            "/reply-console/rate-limit",
+            post(opportunities::reply_console_rate_limit),
+        )
+        .route("/followups", get(opportunities::list_followups))
+        .route(
+            "/opportunities/{id}/followup",
+            post(opportunities::update_followup),
+        )
+        .route(
             "/opportunities/{id}/reply",
             post(opportunities::record_reply),
         )
@@ -206,6 +215,9 @@ pub async fn build_state(config: crate::config::AppConfig) -> anyhow::Result<Arc
         opportunities::list,
         opportunities::reply_console,
         opportunities::reply_console_match,
+        opportunities::reply_console_rate_limit,
+        opportunities::list_followups,
+        opportunities::update_followup,
         opportunities::prepare_drafts,
         opportunities::record_reply,
         opportunities::detail,

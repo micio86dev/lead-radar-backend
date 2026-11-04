@@ -1059,3 +1059,146 @@ async fn verticals_are_seeded_and_validated_on_input() {
     let (status, body) = get(&app, "/api/v1/opportunities?published_after=yesterday").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+#[tokio::test]
+async fn a_recorded_reply_leaves_the_queue_and_sets_the_waiting_time() {
+    let app = setup().await;
+    let lead_id = import_and_lead(&app).await;
+    post(&app, "/api/v1/reply-console/prepare", json!({"limit": 1})).await;
+    lead_radar::worker::drain(&app.state, 20)
+        .await
+        .expect("drain");
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply"),
+        json!({"variant": "helpful", "note": "answered in the thread"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The default queue never re-offers work that is done.
+    let (status, body) = get(&app, "/api/v1/reply-console?limit=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().expect("items").len(), 0, "{body}");
+    assert_eq!(body["stats"]["answered"], 1, "{body}");
+    assert_eq!(body["pacing"]["source"], "publication", "{body}");
+    let wait = body["pacing"]["retry_after_seconds"]
+        .as_i64()
+        .expect("wait");
+    assert!(wait > 0 && wait <= 600, "unexpected wait {wait}");
+
+    // The answered view still shows the lead, with when it was answered.
+    let (status, body) = get(&app, "/api/v1/reply-console?limit=10&include_answered=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().expect("items").len(), 1, "{body}");
+    assert!(
+        body["items"][0]["lead"]["answered_at"].as_str().is_some(),
+        "{body}"
+    );
+
+    // A wait Reddit itself announced replaces the configured floor.
+    let (status, body) = post(
+        &app,
+        "/api/v1/reply-console/rate-limit",
+        json!({"minutes": 3}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["retry_after_seconds"].as_i64().unwrap_or(9999) <= 180);
+    let (_, body) = get(&app, "/api/v1/reply-console?limit=10").await;
+    assert_eq!(body["pacing"]["source"], "reddit_reported", "{body}");
+
+    // Rejected input changes nothing.
+    let (status, _) = post(
+        &app,
+        "/api/v1/reply-console/rate-limit",
+        json!({"minutes": 0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, body) = get(&app, "/api/v1/reply-console?limit=10").await;
+    assert!(
+        body["pacing"]["retry_after_seconds"]
+            .as_i64()
+            .unwrap_or(9999)
+            <= 180,
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn follow_ups_open_on_publication_and_track_reported_replies() {
+    let app = setup().await;
+    let lead_id = import_and_lead(&app).await;
+    post(&app, "/api/v1/reply-console/prepare", json!({"limit": 1})).await;
+    lead_radar::worker::drain(&app.state, 20)
+        .await
+        .expect("drain");
+
+    // Nothing can be followed before a reply was recorded.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/followup"),
+        json!({"state": "waiting"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply"),
+        json!({"variant": "helpful"}),
+    )
+    .await;
+
+    let (status, body) = get(&app, "/api/v1/followups?state=waiting&limit=5").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["lead_id"], lead_id);
+    assert_eq!(items[0]["new_replies"], 0);
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/followup"),
+        json!({
+            "new_replies": 2,
+            "last_reporter": "threadop",
+            "latest_excerpt": "Thanks, that answers it. One more question about pricing.",
+            "latest_reply_at": "2026-11-04T10:00:00Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["new_replies"], 2);
+    assert_eq!(body["state"], "waiting");
+
+    let (_, body) = get(&app, "/api/v1/followups?state=waiting").await;
+    assert_eq!(body["items"][0]["last_reporter"], "threadop", "{body}");
+    assert_eq!(body["items"][0]["new_replies"], 2, "{body}");
+
+    // Closing keeps the record but drops it from the waiting list.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/followup"),
+        json!({"state": "closed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = get(&app, "/api/v1/followups?state=waiting").await;
+    assert_eq!(body["items"].as_array().expect("items").len(), 0, "{body}");
+    let (_, body) = get(&app, "/api/v1/followups?state=all").await;
+    assert_eq!(body["items"][0]["state"], "closed", "{body}");
+
+    // An unknown state is refused and leaves the record untouched.
+    let (status, _) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/followup"),
+        json!({"state": "abandoned"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, body) = get(&app, "/api/v1/followups?state=all").await;
+    assert_eq!(body["items"][0]["state"], "closed", "{body}");
+}

@@ -12,7 +12,8 @@ use crate::auth::TenantContext;
 use crate::domain::enums::{BuyingIntent, CustomerType, Intent, ScoreCategory, Vertical};
 use crate::domain::time::parse_iso;
 use crate::modules::{
-    comments, decision, engagement as engagement_module, operations, qualification, tenancy,
+    comments, decision, engagement as engagement_module, operations, qualification, replies,
+    tenancy,
 };
 use crate::state::SharedState;
 
@@ -289,27 +290,60 @@ pub async fn detail(
     Ok(Json(detail))
 }
 
+fn de_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(matches!(
+        raw.as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConsoleQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Include the leads whose reply was already recorded as published. Off by default so the queue
+    /// never re-offers work that is done. Accepts `1`/`true` because both the page and curl use it.
+    #[serde(default, deserialize_with = "de_flag")]
+    pub include_answered: bool,
+}
+
 #[utoipa::path(get, path = "/api/v1/reply-console", tag = "opportunities", responses((status = 200, description = "Compact reply queue")))]
 pub async fn reply_console(
     State(state): State<SharedState>,
     context: TenantContext,
-    Query(query): Query<Pagination>,
+    Query(query): Query<ConsoleQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let tenant = &context.tenant_id;
-    let limit = query.limit().min(50);
-    let rows = sqlx::query_as::<_, qualification::LeadRow>(
+    let limit = query.limit.unwrap_or(25).clamp(1, 50);
+    let sql = if query.include_answered {
         "SELECT l.*, s.name AS source_name, \
          (SELECT COUNT(*) FROM generated_comments c WHERE c.lead_id = l.id) AS comment_count \
          FROM leads l LEFT JOIN sources s ON s.id = l.source_id \
          WHERE l.tenant_id = ? AND l.is_active = 1 \
          AND l.qualification_status IN ('qualified', 'needs_review') \
          ORDER BY CASE l.qualification_status WHEN 'qualified' THEN 0 ELSE 1 END, \
-         l.score DESC, l.created_at DESC LIMIT ?",
-    )
-    .bind(tenant)
-    .bind(limit)
-    .fetch_all(&state.db.reader)
-    .await?;
+         l.score DESC, l.created_at DESC LIMIT ?"
+    } else {
+        "SELECT l.*, s.name AS source_name, \
+         (SELECT COUNT(*) FROM generated_comments c WHERE c.lead_id = l.id) AS comment_count \
+         FROM leads l LEFT JOIN sources s ON s.id = l.source_id \
+         WHERE l.tenant_id = ? AND l.is_active = 1 \
+         AND l.qualification_status IN ('qualified', 'needs_review') \
+         AND NOT EXISTS (SELECT 1 FROM generated_comments c WHERE c.lead_id = l.id \
+           AND c.status = 'published_manually') \
+         ORDER BY CASE l.qualification_status WHEN 'qualified' THEN 0 ELSE 1 END, \
+         l.score DESC, l.created_at DESC LIMIT ?"
+    };
+    let rows = sqlx::query_as::<_, qualification::LeadRow>(sql)
+        .bind(tenant)
+        .bind(limit)
+        .fetch_all(&state.db.reader)
+        .await?;
+    let answered = replies::publications(&state.db, tenant).await?;
 
     let mut items = Vec::with_capacity(rows.len());
     let mut ready = 0usize;
@@ -331,6 +365,7 @@ pub async fn reply_console(
             .as_ref()
             .map(|post| post.content.chars().take(700).collect::<String>())
             .unwrap_or_default());
+        lead["answered_at"] = json!(answered.get(&row.id));
         items.push(json!({
             "lead": lead,
             "suggested_reply": post.as_ref().and_then(|post| post.author.clone()),
@@ -341,10 +376,160 @@ pub async fn reply_console(
         }));
     }
 
+    let pacing = replies::pacing(&state.db, tenant).await?;
+    let retry_after_seconds = pacing
+        .next_reply_at
+        .as_deref()
+        .and_then(crate::domain::time::parse_iso)
+        .map(|next| (next - chrono::Utc::now()).num_seconds().max(0))
+        .unwrap_or(0);
+
     Ok(Json(json!({
         "items": items,
-        "stats": { "ready": ready, "needs_drafts": needs_drafts, "returned": rows.len() },
+        "stats": {
+            "ready": ready,
+            "needs_drafts": needs_drafts,
+            "returned": rows.len(),
+            "answered": replies::counts(&state.db, tenant).await?,
+        },
+        "pacing": {
+            "next_reply_at": pacing.next_reply_at,
+            "retry_after_seconds": retry_after_seconds,
+            "source": pacing.source,
+        },
     })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RateLimitBody {
+    pub minutes: i64,
+}
+
+#[utoipa::path(post, path = "/api/v1/reply-console/rate-limit", tag = "opportunities", responses((status = 200, description = "Wait recorded"), (status = 400, description = "Invalid minutes")))]
+pub async fn reply_console_rate_limit(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Json(body): Json<RateLimitBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    context.require_reviewer()?;
+    if !(1..=1440).contains(&body.minutes) {
+        return Err(AppError::Validation(vec![crate::error::FieldError::new(
+            "minutes",
+            "must be between 1 and 1440",
+        )]));
+    }
+    let next =
+        crate::domain::time::to_iso(chrono::Utc::now() + chrono::Duration::minutes(body.minutes));
+    replies::set_pacing(&state.db, &context.tenant_id, &next, "reddit_reported").await?;
+    operations::audit(
+        &state.db,
+        &context.tenant_id,
+        &context.actor,
+        "reply_rate_limit_reported",
+        "tenant",
+        Some(&context.tenant_id),
+        &json!({ "minutes": body.minutes }),
+    )
+    .await?;
+    Ok(Json(json!({
+        "next_reply_at": next,
+        "retry_after_seconds": body.minutes * 60,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FollowupQuery {
+    pub state: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[utoipa::path(get, path = "/api/v1/followups", tag = "opportunities", responses((status = 200, description = "Follow-ups")))]
+pub async fn list_followups(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Query(query): Query<FollowupQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let state_filter = match query.state.as_deref() {
+        None | Some("waiting") => Some("waiting"),
+        Some("all") => None,
+        Some(raw) => Some(replies::parse_state(raw).ok_or_else(|| {
+            AppError::Validation(vec![crate::error::FieldError::new(
+                "state",
+                "must be waiting, answered, closed or all",
+            )])
+        })?),
+    };
+    let rows = replies::list(
+        &state.db,
+        &context.tenant_id,
+        state_filter,
+        query.limit.unwrap_or(20),
+    )
+    .await?;
+    Ok(Json(json!({ "items": rows })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FollowupBody {
+    pub state: Option<String>,
+    pub new_replies: Option<i64>,
+    pub last_reporter: Option<String>,
+    pub latest_excerpt: Option<String>,
+    pub latest_reply_at: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/opportunities/{id}/followup", tag = "opportunities", responses((status = 200, description = "Follow-up updated"), (status = 409, description = "No publication recorded")))]
+pub async fn update_followup(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Path(id): Path<String>,
+    Json(body): Json<FollowupBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    let tenant = &context.tenant_id;
+    context.require_reviewer()?;
+    let lead = qualification::get_lead(&state.db, tenant, &id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let state_value = match body.state.as_deref() {
+        None => None,
+        Some(raw) => Some(replies::parse_state(raw).ok_or_else(|| {
+            AppError::Validation(vec![crate::error::FieldError::new(
+                "state",
+                "must be waiting, answered or closed",
+            )])
+        })?),
+    };
+    if let Some(count) = body.new_replies {
+        if !(0..=10_000).contains(&count) {
+            return Err(AppError::Validation(vec![crate::error::FieldError::new(
+                "new_replies",
+                "must be between 0 and 10000",
+            )]));
+        }
+    }
+    if replies::publication_time(&state.db, tenant, &lead.id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::Conflict(
+            "no_publication: record the posted reply before tracking its follow-up".to_string(),
+        ));
+    }
+    let row = replies::upsert_followup(
+        &state.db,
+        tenant,
+        &lead.id,
+        &replies::FollowupUpdate {
+            state: state_value,
+            new_replies: body.new_replies,
+            last_reporter: body.last_reporter.as_deref(),
+            last_excerpt: body.latest_excerpt.as_deref(),
+            last_reply_at: body.latest_reply_at.as_deref(),
+        },
+    )
+    .await?;
+    Ok(Json(json!(row)))
 }
 
 /// Normalise a Reddit URL so the extension can find the lead from the page it is on.
@@ -405,12 +590,14 @@ pub async fn reply_console_match(
         .as_ref()
         .map(|post| post.content.chars().take(700).collect::<String>())
         .unwrap_or_default());
+    let followup = replies::followup_for_lead(&state.db, tenant, &row.id).await?;
     Ok(Json(json!({
         "lead": lead,
         "comments": comment_rows
             .iter()
             .map(|comment| comments::summary(comment.clone()))
             .collect::<Vec<_>>(),
+        "followup": followup,
     })))
 }
 
@@ -525,6 +712,14 @@ pub async fn record_reply(
         .unwrap_or(serde_json::Value::Null);
     }
     qualification::set_review_status(&state.db, tenant, &lead.id, "resolved").await?;
+    replies::record_publication(
+        &state.db,
+        tenant,
+        &lead.id,
+        &published.id,
+        state.config.reply_min_interval_minutes,
+    )
+    .await?;
     operations::audit(
         &state.db,
         tenant,

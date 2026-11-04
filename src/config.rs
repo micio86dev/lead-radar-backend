@@ -249,6 +249,9 @@ pub struct AppConfig {
     pub laya: LayaConfig,
     pub qwen: QwenConfig,
     pub worker: WorkerConfig,
+    /// Conservative wait applied after a recorded publication. Reddit's real limit belongs to the
+    /// account; this floor only stops the dashboard from encouraging a reply too soon.
+    pub reply_min_interval_minutes: i64,
 }
 
 impl AppConfig {
@@ -294,6 +297,7 @@ impl AppConfig {
             }
         };
 
+        let reply_min_interval_minutes = integer("REPLY_MIN_INTERVAL_MINUTES", 10)?;
         let app_env = AppEnv::parse(&required("APP_ENV")?)?;
         let port = integer("APP_PORT", 8080)?;
         let port: u16 = port
@@ -404,6 +408,7 @@ impl AppConfig {
                 retry_backoff_seconds: integer("JOB_RETRY_BACKOFF", 5)?,
                 lease_seconds: integer("JOB_LEASE_SECONDS", 120)?,
             },
+            reply_min_interval_minutes,
         };
         config.validate()?;
         Ok(config)
@@ -416,6 +421,9 @@ impl AppConfig {
         }
         if self.database_url.trim().is_empty() {
             bail!("DATABASE_URL must not be empty");
+        }
+        if self.reply_min_interval_minutes < 1 || self.reply_min_interval_minutes > 1440 {
+            bail!("REPLY_MIN_INTERVAL_MINUTES must be between 1 and 1440");
         }
         if self.retention_days < 1 || self.retention_days > 3650 {
             bail!("RETENTION_DAYS must be between 1 and 3650");
