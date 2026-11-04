@@ -15,11 +15,6 @@ use crate::modules::{new_id, operations, qualification, to_json};
 use crate::providers::ProviderError;
 use crate::state::AppState;
 
-const PRODUCT_CONTEXT: &str = "VoxTranslate is a real-time multilingual voice translation product \
-for live conversations: meetings, interviews, events, customer support and hospitality. It \
-translates speech while people keep speaking their own language. Do not claim pricing, integrations \
-or capabilities beyond this description.";
-
 #[derive(Debug, thiserror::Error)]
 pub enum GenerativeError {
     #[error("lead not found")]
@@ -30,6 +25,10 @@ pub enum GenerativeError {
     Provider(#[from] ProviderError),
     #[error("invalid generated content: {0}")]
     InvalidContent(String),
+    /// No project is configured, so there is nothing to write about. Guessing a product would put a
+    /// fiction in front of a human reviewer.
+    #[error("no project configured: add one on /projects before generating drafts")]
+    NoProject,
 }
 
 impl GenerativeError {
@@ -37,7 +36,7 @@ impl GenerativeError {
         match self {
             Self::Provider(error) => error.is_retryable(),
             Self::Database(_) => true,
-            Self::NotFound | Self::InvalidContent(_) => false,
+            Self::NotFound | Self::InvalidContent(_) | Self::NoProject => false,
         }
     }
 }
@@ -117,6 +116,10 @@ pub async fn analyze_lead(
         .map(|item| item.excerpt)
         .collect();
 
+    let project = crate::modules::projects::default_project(&state.db, tenant_id)
+        .await?
+        .ok_or(GenerativeError::NoProject)?;
+
     let system = "You analyse B2B opportunities for a supplier of real-time multilingual voice \
 translation. Ground every statement in the supplied content; never invent budget, company size, \
 authority, timeline or willingness to buy. Answer with JSON.";
@@ -124,7 +127,7 @@ authority, timeline or willingness to buy. Answer with JSON.";
         "{}\n\n{}\n\nlanguage: {}\n\nSummarise the need, the risk of misreading it and a suggested \
 commercial approach for a human reviewer.",
         lead_context(&lead, &post.content, &evidence),
-        PRODUCT_CONTEXT,
+        project.prompt_context(),
         lead.language.clone().unwrap_or_else(|| "und".to_string()),
     );
 
@@ -266,16 +269,16 @@ fn truncate(text: &str, limit: usize) -> String {
 }
 
 /// Rules quoted in the prompt. They mirror `domain::comment::validate` exactly.
-fn policy_rules(language: &str) -> String {
-    let examples = crate::domain::comment::DISCLOSURE_EXAMPLES
-        .iter()
+fn policy_rules(language: &str, product: &str) -> String {
+    let examples = crate::domain::comment::disclosure_examples(product)
+        .into_iter()
         .map(|(code, sentence)| format!("{code}: \"{sentence}\""))
         .collect::<Vec<_>>()
         .join(" | ");
     format!(
         "Rules checked automatically after generation (a draft that breaks one is rejected):\n\
          - The discussion language is {language}; write every body in it.\n\
-         - soft_pitch and direct_pitch must name VoxTranslate and open with an affiliation \
+         - soft_pitch and direct_pitch must name {} and open with an affiliation \
          disclosure. Use the documented form for the language: {examples}\n\
          - Never use any of these phrases: {}.\n\
          - The helpful variant must stay non-promotional, must not name the product, and must not \
@@ -288,6 +291,7 @@ fn policy_rules(language: &str) -> String {
          on\", \"not sure\", \"that bit I have not tried\"). Never offer to help further, never ask \
          for a DM, never suggest a call, never sound enthusiastic about a product. Never use any of \
          these phrases: {}.",
+        product,
         crate::domain::comment::FORBIDDEN_PHRASES.join(", "),
         crate::domain::comment::PROMOTIONAL_PHRASES.join(", "),
         crate::domain::comment::MACHINE_PHRASES.join(", "),
@@ -304,6 +308,7 @@ struct DraftOutcome {
 type RejectedDraft = (CommentVariant, String, Vec<CommentIssue>);
 
 /// Validate every draft, store the ones that pass and return the rejected ones with their reasons.
+#[allow(clippy::too_many_arguments)]
 async fn validate_and_store(
     state: &AppState,
     tenant_id: &str,
@@ -311,6 +316,7 @@ async fn validate_and_store(
     language: &str,
     actor: &str,
     variants: Vec<(CommentVariant, String)>,
+    product: &str,
     outcome: &mut DraftOutcome,
 ) -> Result<Vec<RejectedDraft>, GenerativeError> {
     let mut rejected: Vec<RejectedDraft> = Vec::new();
@@ -328,7 +334,7 @@ async fn validate_and_store(
             language: language.to_string(),
             body: body.clone(),
         };
-        let problems = validate(&draft);
+        let problems = validate(&draft, product);
         if problems.is_empty() {
             seen.push(variant);
             store_comment(
@@ -411,13 +417,19 @@ pub async fn generate_comments(
         .clone()
         .unwrap_or_else(|| crate::domain::language::detect(&post.content));
 
+    let project = crate::modules::projects::default_project(&state.db, tenant_id)
+        .await?
+        .ok_or(GenerativeError::NoProject)?;
+    let product = project.name.trim().to_string();
+    let product_context = project.prompt_context();
+
     let system = "You write short, specific replies for a human to review before posting in a \
 public discussion. Answer the actual problem, in the discussion's language, and never invent \
 personal experience, testimonials, pricing or integrations. Answer with JSON only.";
 
     // The prompt quotes the same rules the validator enforces, so the model is never asked to guess
     // them and the two cannot drift apart.
-    let policy = policy_rules(&language);
+    let policy = policy_rules(&language, &product);
     let engagement = engagement_rules(state, tenant_id, lead.community.as_deref()).await;
     let user = format!(
         "{}\n\n{}\n\nlanguage: {}\n\n{}\n\nProduce exactly three variants as JSON: \
@@ -425,7 +437,7 @@ personal experience, testimonials, pricing or integrations. Answer with JSON onl
 \"body\":\"...\"}},{{\"variant\":\"direct_pitch\",\"body\":\"...\"}}]}}. Each body must be one \
 paragraph between 40 and 1200 characters.",
         lead_context(&lead, &post.content, &evidence),
-        PRODUCT_CONTEXT,
+        product_context,
         language,
         policy,
     );
@@ -454,7 +466,7 @@ paragraph between 40 and 1200 characters.",
     }
     let mut draft = DraftOutcome::default();
     let rejected = validate_and_store(
-        state, tenant_id, lead_id, &language, actor, pending, &mut draft,
+        state, tenant_id, lead_id, &language, actor, pending, &product, &mut draft,
     )
     .await?;
     let mut corrective_content = None;
@@ -498,6 +510,7 @@ paragraph between 40 and 1200 characters.",
             &language,
             actor,
             retry_variants,
+            &product,
             &mut draft,
         )
         .await?;

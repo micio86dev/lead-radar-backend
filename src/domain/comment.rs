@@ -82,16 +82,19 @@ pub const DISCLOSURE_MARKERS: [&str; 15] = [
     "hinweis:",
 ];
 
-/// One disclosure sentence per supported language. The generator prompt quotes these examples, and a
-/// test proves each of them satisfies the validator, so prompt and policy cannot drift apart.
-pub const DISCLOSURE_EXAMPLES: [(&str, &str); 6] = [
-    ("en", "Disclosure: I work on VoxTranslate."),
-    ("es", "Aviso: trabajo en VoxTranslate."),
-    ("pt", "Aviso: trabalho na VoxTranslate."),
-    ("it", "Avviso: lavoro su VoxTranslate."),
-    ("fr", "Avis : je travaille sur VoxTranslate."),
-    ("de", "Hinweis: ich arbeite an VoxTranslate."),
-];
+/// One disclosure sentence per supported language, built from the project name. The generator prompt
+/// quotes these examples, and a test proves each of them satisfies the validator, so prompt and
+/// policy cannot drift apart.
+pub fn disclosure_examples(product: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("en", format!("Disclosure: I work on {product}.")),
+        ("es", format!("Aviso: trabajo en {product}.")),
+        ("pt", format!("Aviso: trabalho na {product}.")),
+        ("it", format!("Avviso: lavoro su {product}.")),
+        ("fr", format!("Avis : je travaille sur {product}.")),
+        ("de", format!("Hinweis: ich arbeite an {product}.")),
+    ]
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentDraft {
@@ -128,8 +131,10 @@ pub enum CommentIssue {
     },
 }
 
-/// Validate one generated draft. Empty result means the draft may be stored (still as a draft).
-pub fn validate(draft: &CommentDraft) -> Vec<CommentIssue> {
+/// Validate one generated draft against the product it is about. Empty result means the draft may be
+/// stored (still as a draft). `product` is the project name: a pitch must name it and disclose the
+/// affiliation, and the helpful variant must not name it at all.
+pub fn validate(draft: &CommentDraft, product: &str) -> Vec<CommentIssue> {
     let mut issues = Vec::new();
     let body = draft.body.trim();
     let characters = body.chars().count();
@@ -161,7 +166,7 @@ pub fn validate(draft: &CommentDraft) -> Vec<CommentIssue> {
                 });
             }
         }
-        if lowered.contains("voxtranslate") {
+        if !product.trim().is_empty() && lowered.contains(&product.to_lowercase()) {
             issues.push(CommentIssue::ProductMentionInHelpful);
         }
     }
@@ -198,7 +203,8 @@ pub fn validate(draft: &CommentDraft) -> Vec<CommentIssue> {
         draft.variant,
         CommentVariant::SoftPitch | CommentVariant::DirectPitch
     ) {
-        let discloses = lowered.contains("voxtranslate")
+        let discloses = !product.trim().is_empty()
+            && lowered.contains(&product.to_lowercase())
             && DISCLOSURE_MARKERS
                 .iter()
                 .any(|marker| lowered.contains(marker));
@@ -222,6 +228,11 @@ pub fn validate(draft: &CommentDraft) -> Vec<CommentIssue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every policy test is about one product; keep the call sites readable.
+    fn validate(draft: &CommentDraft) -> Vec<CommentIssue> {
+        super::validate(draft, "VoxTranslate")
+    }
 
     fn draft(variant: CommentVariant, language: &str, body: &str) -> CommentDraft {
         CommentDraft {
@@ -306,7 +317,7 @@ mod tests {
 
     #[test]
     fn every_documented_disclosure_example_is_accepted_by_the_policy() {
-        for (language, sentence) in DISCLOSURE_EXAMPLES {
+        for (language, sentence) in disclosure_examples("VoxTranslate") {
             let lowered = sentence.to_lowercase();
             assert!(
                 lowered.contains("voxtranslate"),
@@ -397,6 +408,11 @@ mod transition_tests {
 #[cfg(test)]
 mod voice_tests {
     use super::*;
+
+    /// Every policy test is about one product; keep the call sites readable.
+    fn validate(draft: &CommentDraft) -> Vec<CommentIssue> {
+        super::validate(draft, "VoxTranslate")
+    }
 
     fn draft(variant: CommentVariant, body: &str) -> CommentDraft {
         CommentDraft {

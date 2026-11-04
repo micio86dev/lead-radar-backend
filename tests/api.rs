@@ -962,6 +962,134 @@ async fn seeds_are_idempotent() {
 }
 
 #[tokio::test]
+async fn a_project_ranks_only_the_communities_that_are_validated_and_enabled() {
+    let app = setup().await;
+
+    // Two communities: one validated and enabled, one still pending and disabled.
+    let (_, communities) = get(&app, "/api/v1/communities?per_page=100").await;
+    let find = |name: &str| -> String {
+        communities["items"]
+            .as_array()
+            .expect("communities")
+            .iter()
+            .find(|community| community["name"] == name)
+            .expect("community")["id"]
+            .as_str()
+            .expect("id")
+            .to_string()
+    };
+    let active = find("humanresources");
+    let dormant = find("hospitality");
+    let (status, _) = post(
+        &app,
+        &format!("/api/v1/communities/{active}/validate"),
+        json!({"outcome": "validated", "evidence": "rules read 2026-11-04"}),
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, _) = patch(
+        &app,
+        &format!("/api/v1/communities/{active}"),
+        json!({"enabled": true}),
+    )
+    .await;
+    assert!(status.is_success());
+
+    let (status, project) = post(
+        &app,
+        "/api/v1/projects",
+        json!({
+            "name": "Voice Translate Demo",
+            "summary": "Real-time multilingual voice translation for live meetings and interviews.",
+            "website_urls": []
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    // The seed already gave the tenant its default project, so a new one never steals it.
+    assert_eq!(project["is_default"], false, "{project}");
+    let project_id = project["id"].as_str().expect("project id").to_string();
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/projects/{project_id}/match-communities"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["candidates"], 1, "{body}");
+    let ranked = body["communities"].as_array().expect("matches");
+    assert_eq!(ranked.len(), 1, "{body}");
+    assert_eq!(ranked[0]["name"], "humanresources");
+    assert_eq!(ranked[0]["enabled"], true);
+    assert!(ranked[0]["relevance"].as_i64().unwrap_or(0) > 0);
+
+    // The pending, disabled community is never a candidate.
+    assert!(ranked
+        .iter()
+        .all(|match_row| match_row["community_id"] != dormant.as_str()));
+
+    // A project with no candidate community is refused instead of returning an empty ranking.
+    let (status, _) = patch(
+        &app,
+        &format!("/api/v1/communities/{active}"),
+        json!({"enabled": false}),
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/projects/{project_id}/match-communities"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[tokio::test]
+async fn projects_are_tenant_scoped_and_the_drafting_prompts_use_the_default_one() {
+    let app = setup().await;
+    let (status, project) = post(
+        &app,
+        "/api/v1/projects",
+        json!({"name": "Acme Translate", "summary": "Speech translation for call centres."}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    let project_id = project["id"].as_str().expect("id").to_string();
+
+    // Another tenant cannot see or patch it.
+    let (status, body) = get_as(
+        &app,
+        &format!("/api/v1/projects/{project_id}"),
+        common::TOKEN_B,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // A second project is not the default; the first one stays the prompt context.
+    let (status, second) = post(
+        &app,
+        "/api/v1/projects",
+        json!({"name": "Second product", "summary": "Something else entirely."}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_eq!(second["is_default"], false, "{second}");
+    let second_id = second["id"].as_str().expect("id").to_string();
+    let (status, promoted) = patch(
+        &app,
+        &format!("/api/v1/projects/{second_id}"),
+        json!({"is_default": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{promoted}");
+    assert_eq!(promoted["is_default"], true);
+    let (_, first) = get(&app, &format!("/api/v1/projects/{project_id}")).await;
+    assert_eq!(first["project"]["is_default"], false);
+}
+
+#[tokio::test]
 async fn a_pitch_is_not_recorded_as_published_until_the_community_allows_it() {
     let app = setup().await;
     let lead_id = import_and_lead(&app).await;

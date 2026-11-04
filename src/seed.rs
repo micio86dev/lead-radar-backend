@@ -28,6 +28,38 @@ pub struct SeedReport {
     pub bootstrap_token_created: bool,
 }
 
+/// The product description that used to live as a constant in the drafting prompt. It becomes the
+/// tenant's first project row, so existing behaviour survives while the code stops carrying a
+/// product description of its own.
+pub const LEGACY_DEFAULT_PROJECT_NAME: &str = "VoxTranslate";
+pub const LEGACY_DEFAULT_PROJECT_SUMMARY: &str = "VoxTranslate is a real-time multilingual voice \
+translation product for live conversations: meetings, interviews, events, customer support and \
+hospitality. It translates speech while people keep speaking their own language. Do not claim \
+pricing, integrations or capabilities beyond this description.";
+
+/// Give a tenant its first project when it has none. Never overwrites an existing one: once the
+/// operator edits the project, that text is theirs.
+pub async fn ensure_default_project(db: &Db, tenant_id: &str) -> anyhow::Result<bool> {
+    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE tenant_id = ?")
+        .bind(tenant_id)
+        .fetch_one(&db.reader)
+        .await?;
+    if existing > 0 {
+        return Ok(false);
+    }
+    crate::modules::projects::create_project(
+        db,
+        tenant_id,
+        &crate::modules::projects::NewProject {
+            name: LEGACY_DEFAULT_PROJECT_NAME,
+            summary: LEGACY_DEFAULT_PROJECT_SUMMARY,
+            website_urls: &[],
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
 /// Verticals, their keyword lists and the shared negative keywords.
 fn vertical_keywords() -> Vec<(Vertical, Vec<&'static str>)> {
     vec![
@@ -234,6 +266,7 @@ pub async fn seed_all(config: &AppConfig, db: &Db) -> anyhow::Result<SeedReport>
     tenancy::ensure_tenant(db, &tenant_id, "Lead Radar (local)", "lead-radar").await?;
     tenancy::ensure_user(db, DEV_USER_ID, DEV_EMAIL, DEV_NAME).await?;
     tenancy::ensure_membership(db, &tenant_id, DEV_USER_ID, Role::Owner).await?;
+    ensure_default_project(db, &tenant_id).await?;
 
     if let Some(token) = &config.bootstrap_api_token {
         report.bootstrap_token_created = tenancy::ensure_api_token(

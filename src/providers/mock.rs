@@ -440,7 +440,11 @@ impl GenerativeProvider for MockGenerativeProvider {
             .next()
             .unwrap_or("en")
             .to_ascii_lowercase();
-        let content = if schema_hint.contains("comment_variants") {
+        let content = if schema_hint.contains("matches") {
+            // A project/community analysis: score the candidates the caller listed, lowest last, so a
+            // test can assert both the ranking and that unknown names are dropped.
+            json!({ "matches": candidate_matches(user) })
+        } else if schema_hint.contains("comment_variants") {
             json!({
                 "variants": [
                     {"variant": "helpful", "body": comment_body("helpful", &language)},
@@ -465,6 +469,37 @@ impl GenerativeProvider for MockGenerativeProvider {
             latency_ms: 1,
         })
     }
+}
+
+/// Read the candidate names the prompt lists after its COMMUNITIES header and score them, so the
+/// mock answers with names the caller actually supplied.
+fn candidate_matches(user: &str) -> Vec<serde_json::Value> {
+    let mut matches = Vec::new();
+    let mut in_list = false;
+    for line in user.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("COMMUNITIES") {
+            in_list = true;
+            continue;
+        }
+        if !in_list {
+            continue;
+        }
+        if trimmed.is_empty() {
+            break;
+        }
+        let name = trimmed.split_whitespace().next().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let relevance = 95i64 - (matches.len() as i64 * 15);
+        matches.push(json!({
+            "community": name,
+            "relevance": relevance.max(5),
+            "reason": format!("mock: {name} discusses the underlying problem")
+        }));
+    }
+    matches
 }
 
 /// In-memory Apify stand-in. A run starts `running` and finishes `succeeded` with two deterministic
