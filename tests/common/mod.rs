@@ -47,7 +47,21 @@ pub async fn setup() -> TestApp {
     setup_with("mock", "mock", "mock").await
 }
 
+/// Setup with additional environment variables (for example a bootstrap token).
+pub async fn setup_with_vars(extra: &[(&str, &str)]) -> TestApp {
+    setup_inner("mock", "mock", "mock", extra).await
+}
+
 pub async fn setup_with(decision: &str, generative: &str, source: &str) -> TestApp {
+    setup_inner(decision, generative, source, &[]).await
+}
+
+async fn setup_inner(
+    decision: &str,
+    generative: &str,
+    source: &str,
+    extra: &[(&str, &str)],
+) -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let database_url = format!("sqlite://{}/test.db?mode=rwc", dir.path().display());
     let mut vars: HashMap<String, String> = HashMap::new();
@@ -68,6 +82,9 @@ pub async fn setup_with(decision: &str, generative: &str, source: &str) -> TestA
     ];
     for (key, value) in entries {
         vars.insert(key.to_string(), value.to_string());
+    }
+    for (key, value) in extra {
+        vars.insert((*key).to_string(), (*value).to_string());
     }
     vars.insert("DATABASE_URL".to_string(), database_url);
 

@@ -236,6 +236,9 @@ pub struct AppConfig {
     pub log_level: String,
     pub default_tenant_id: String,
     pub dev_api_token: Option<String>,
+    /// Production bootstrap: a strong token stored (hashed) during seeding so the dashboard can
+    /// authenticate before any token-management UI exists. Rotate it like any other credential.
+    pub bootstrap_api_token: Option<String>,
     pub cors_allowed_origins: Vec<String>,
     pub retention_days: i64,
     pub decision_provider: DecisionChoice,
@@ -333,6 +336,7 @@ impl AppConfig {
             log_level: get("LOG_LEVEL").unwrap_or_else(|| "info".to_string()),
             default_tenant_id,
             dev_api_token: get("DEV_API_TOKEN").filter(|token| !token.is_empty()),
+            bootstrap_api_token: get("BOOTSTRAP_API_TOKEN").filter(|token| !token.is_empty()),
             cors_allowed_origins: get("CORS_ALLOWED_ORIGINS")
                 .filter(|origins| !origins.is_empty())
                 .map(|origins| {
@@ -458,6 +462,11 @@ impl AppConfig {
         }
         if self.worker.ai_concurrency > self.worker.concurrency {
             bail!("WORKER_AI_CONCURRENCY must not exceed WORKER_CONCURRENCY");
+        }
+        if let Some(token) = &self.bootstrap_api_token {
+            if token.chars().count() < 24 {
+                bail!("BOOTSTRAP_API_TOKEN must be at least 24 characters long");
+            }
         }
         if self.app_env == AppEnv::Production && self.dev_api_token.is_some() {
             bail!(
@@ -621,6 +630,14 @@ mod tests {
             config.qwen.endpoint().as_deref(),
             Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions")
         );
+    }
+
+    #[test]
+    fn a_short_bootstrap_token_is_rejected() {
+        let mut vars = base_map();
+        vars.insert("BOOTSTRAP_API_TOKEN".into(), "too-short".into());
+        let error = AppConfig::from_map(&vars).expect_err("must fail");
+        assert!(error.to_string().contains("BOOTSTRAP_API_TOKEN"));
     }
 
     #[test]

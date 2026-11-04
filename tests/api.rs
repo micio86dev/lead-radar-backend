@@ -697,6 +697,16 @@ async fn benchmark_runs_against_the_seeded_evaluation_split() {
 }
 
 #[tokio::test]
+async fn a_bootstrap_token_authenticates_from_the_database() {
+    let token = "bootstrap-token-with-enough-length-123456";
+    let app = common::setup_with_vars(&[("BOOTSTRAP_API_TOKEN", token)]).await;
+    let (status, body) = get_as(&app, "/api/v1/dashboard", token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = get_as(&app, "/api/v1/dashboard", "wrong-token").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn seeds_are_idempotent() {
     let app = setup().await;
     let config = app.state.config.clone();

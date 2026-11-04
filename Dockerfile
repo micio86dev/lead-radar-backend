@@ -15,6 +15,8 @@ COPY --from=builder /app/target/release/api /usr/local/bin/api
 COPY --from=builder /app/target/release/worker /usr/local/bin/worker
 COPY --from=builder /app/target/release/db /usr/local/bin/db
 COPY --from=builder /app/target/release/healthcheck /usr/local/bin/healthcheck
+COPY deploy/stack.sh /usr/local/bin/stack
+RUN chmod +x /usr/local/bin/stack
 RUN mkdir -p /data && chown 10001:10001 /data
 ENV APP_HOST=0.0.0.0 \
     APP_PORT=8080 \
@@ -22,4 +24,6 @@ ENV APP_HOST=0.0.0.0 \
 USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/usr/local/bin/api"]
+# Compose overrides this with the individual binaries; a single-node host runs the stack entrypoint,
+# which applies migrations and seeds before starting the worker and the API.
+CMD ["/usr/local/bin/stack"]

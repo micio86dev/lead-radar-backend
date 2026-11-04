@@ -25,6 +25,7 @@ pub struct SeedReport {
     pub benchmark_items: usize,
     pub manual_source: bool,
     pub dev_token_created: bool,
+    pub bootstrap_token_created: bool,
 }
 
 /// Verticals, their keyword lists and the shared negative keywords.
@@ -227,6 +228,16 @@ pub async fn seed_all(config: &AppConfig, db: &Db) -> anyhow::Result<SeedReport>
     tenancy::ensure_user(db, DEV_USER_ID, DEV_EMAIL, DEV_NAME).await?;
     tenancy::ensure_membership(db, &tenant_id, DEV_USER_ID, Role::Owner).await?;
 
+    if let Some(token) = &config.bootstrap_api_token {
+        report.bootstrap_token_created = tenancy::ensure_api_token(
+            db,
+            &tenant_id,
+            DEV_USER_ID,
+            &crate::auth::hash_token(token),
+            "bootstrap (environment)",
+        )
+        .await?;
+    }
     if let Some(token) = &config.dev_api_token {
         report.dev_token_created = tenancy::ensure_api_token(
             db,
