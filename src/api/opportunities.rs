@@ -289,6 +289,262 @@ pub async fn detail(
     Ok(Json(detail))
 }
 
+#[utoipa::path(get, path = "/api/v1/reply-console", tag = "opportunities", responses((status = 200, description = "Compact reply queue")))]
+pub async fn reply_console(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Query(query): Query<Pagination>,
+) -> AppResult<Json<serde_json::Value>> {
+    let tenant = &context.tenant_id;
+    let limit = query.limit().min(50);
+    let rows = sqlx::query_as::<_, qualification::LeadRow>(
+        "SELECT l.*, s.name AS source_name, \
+         (SELECT COUNT(*) FROM generated_comments c WHERE c.lead_id = l.id) AS comment_count \
+         FROM leads l LEFT JOIN sources s ON s.id = l.source_id \
+         WHERE l.tenant_id = ? AND l.is_active = 1 \
+         AND l.qualification_status IN ('qualified', 'needs_review') \
+         ORDER BY CASE l.qualification_status WHEN 'qualified' THEN 0 ELSE 1 END, \
+         l.score DESC, l.created_at DESC LIMIT ?",
+    )
+    .bind(tenant)
+    .bind(limit)
+    .fetch_all(&state.db.reader)
+    .await?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    let mut ready = 0usize;
+    let mut needs_drafts = 0usize;
+    for row in &rows {
+        let post = crate::modules::ingestion::get_post(&state.db, tenant, &row.post_id).await?;
+        let comment_rows = comments::comments_for_lead(&state.db, tenant, &row.id).await?;
+        if comment_rows.is_empty() {
+            needs_drafts += 1;
+        } else {
+            ready += 1;
+        }
+        let mut lead = lead_list_json(
+            row,
+            qualification::lead_evidence(row).len(),
+            row.comment_count,
+        );
+        lead["content_snippet"] = serde_json::json!(post
+            .as_ref()
+            .map(|post| post.content.chars().take(700).collect::<String>())
+            .unwrap_or_default());
+        items.push(json!({
+            "lead": lead,
+            "suggested_reply": post.as_ref().and_then(|post| post.author.clone()),
+            "comments": comment_rows
+                .iter()
+                .map(|comment| comments::summary(comment.clone()))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    Ok(Json(json!({
+        "items": items,
+        "stats": { "ready": ready, "needs_drafts": needs_drafts, "returned": rows.len() },
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplyBody {
+    pub variant: String,
+    pub body: Option<String>,
+    pub engagement_kind: Option<String>,
+    pub note: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/opportunities/{id}/reply", tag = "opportunities", responses((status = 200, description = "Reply recorded as manually posted"), (status = 409, description = "Draft missing or already used")))]
+pub async fn record_reply(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Path(id): Path<String>,
+    Json(body): Json<ReplyBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    let tenant = &context.tenant_id;
+    context.require_reviewer()?;
+    let lead = qualification::get_lead(&state.db, tenant, &id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let variant = crate::domain::enums::CommentVariant::parse(&body.variant).ok_or_else(|| {
+        AppError::Validation(vec![crate::error::FieldError::new(
+            "variant",
+            "must be helpful, soft_pitch or direct_pitch",
+        )])
+    })?;
+    let comment = comments::comments_for_lead(&state.db, tenant, &lead.id)
+        .await?
+        .into_iter()
+        .find(|comment| comment.variant == variant.as_str())
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "draft_missing: generate the comment variants for this lead first".to_string(),
+            )
+        })?;
+
+    let mut current = comment;
+    if let Some(text) = body
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        if text != current.body {
+            current = comments::patch_comment(
+                &state.db,
+                tenant,
+                &current.id,
+                Some(text),
+                None,
+                &context.actor,
+            )
+            .await
+            .map_err(map_comment_error)?;
+        }
+    }
+    if current.status != "approved" {
+        current = comments::approve_comment(
+            &state.db,
+            tenant,
+            &current.id,
+            &context.actor,
+            Some("approved from the reply console"),
+        )
+        .await
+        .map_err(map_comment_error)?;
+    }
+    let note = body
+        .note
+        .as_deref()
+        .filter(|note| !note.trim().is_empty())
+        .unwrap_or("posted manually from the reply console");
+    let published = comments::record_publication(
+        &state.db,
+        tenant,
+        &current.id,
+        &context.actor,
+        None,
+        Some(note),
+    )
+    .await
+    .map_err(map_comment_error)?;
+
+    let mut engagement = serde_json::Value::Null;
+    if let Some(kind) = body
+        .engagement_kind
+        .as_deref()
+        .filter(|kind| !kind.trim().is_empty())
+    {
+        let kind = crate::modules::engagement::EngagementKind::parse(kind).ok_or_else(|| {
+            AppError::Validation(vec![crate::error::FieldError::new(
+                "engagement_kind",
+                "must be reply, dm, meeting, interest, lost or other",
+            )])
+        })?;
+        engagement = crate::modules::engagement::create_engagement(
+            &state.db,
+            tenant,
+            &crate::modules::engagement::NewEngagement {
+                lead_id: &lead.id,
+                comment_id: Some(&published.id),
+                kind,
+                note: body.note.as_deref(),
+                occurred_at: None,
+            },
+        )
+        .await?
+        .map(|row| json!(row))
+        .unwrap_or(serde_json::Value::Null);
+    }
+    qualification::set_review_status(&state.db, tenant, &lead.id, "resolved").await?;
+    operations::audit(
+        &state.db,
+        tenant,
+        &context.actor,
+        "reply_recorded_as_posted",
+        "generated_comment",
+        Some(&published.id),
+        &json!({"lead_id": lead.id, "variant": variant.as_str(), "engagement": body.engagement_kind}),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "comment": comments::summary(published),
+        "engagement": engagement,
+        "lead_id": lead.id,
+    })))
+}
+
+fn map_comment_error(error: comments::CommentError) -> AppError {
+    match error {
+        comments::CommentError::NotFound => AppError::NotFound,
+        comments::CommentError::InvalidTransition(message)
+        | comments::CommentError::InvalidInput(message) => AppError::Conflict(message),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrepareBody {
+    pub limit: Option<i64>,
+}
+
+#[utoipa::path(post, path = "/api/v1/reply-console/prepare", tag = "opportunities", responses((status = 202, description = "Comment drafts queued"), (status = 503, description = "Generative provider unconfigured")))]
+pub async fn prepare_drafts(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Json(body): Json<PrepareBody>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let tenant = &context.tenant_id;
+    if !state.providers.generative.metadata().configured {
+        return Err(AppError::NotReady(
+            "generative provider is not configured (QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL)"
+                .to_string(),
+        ));
+    }
+    let limit = body.limit.unwrap_or(5).clamp(1, 10);
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT l.id, l.post_id FROM leads l \
+         WHERE l.tenant_id = ? AND l.is_active = 1 \
+         AND l.qualification_status IN ('qualified', 'needs_review') \
+         AND NOT EXISTS (SELECT 1 FROM generated_comments c WHERE c.lead_id = l.id) \
+         ORDER BY CASE l.qualification_status WHEN 'qualified' THEN 0 ELSE 1 END, \
+         l.score DESC LIMIT ?",
+    )
+    .bind(tenant)
+    .bind(limit)
+    .fetch_all(&state.db.reader)
+    .await?;
+
+    let mut job_ids = Vec::new();
+    for (lead_id, _) in &rows {
+        let (job_id, _) = operations::enqueue(
+            &state.db,
+            Some(tenant),
+            crate::domain::enums::JobKind::CommentGeneration,
+            &json!({ "lead_id": lead_id, "actor": context.actor }),
+            None,
+            state.config.worker.max_attempts,
+        )
+        .await?;
+        job_ids.push(job_id);
+    }
+    operations::audit(
+        &state.db,
+        tenant,
+        &context.actor,
+        "reply_console_prepared",
+        "tenant",
+        Some(tenant),
+        &json!({ "queued": job_ids.len() }),
+    )
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "queued": job_ids.len(), "job_ids": job_ids })),
+    ))
+}
+
 #[utoipa::path(post, path = "/api/v1/opportunities/{id}/analyze", tag = "opportunities", responses((status = 202, description = "Analysis queued"), (status = 404, description = "Unknown opportunity")))]
 pub async fn analyze(
     State(state): State<SharedState>,

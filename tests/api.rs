@@ -697,6 +697,83 @@ async fn benchmark_runs_against_the_seeded_evaluation_split() {
 }
 
 #[tokio::test]
+async fn the_reply_console_queues_drafts_and_records_a_manual_reply_in_one_call() {
+    let app = setup().await;
+    let lead_id = import_and_lead(&app).await;
+
+    // The console lists the lead and reports that drafts are missing.
+    let (status, body) = get(&app, "/api/v1/reply-console?limit=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stats"]["needs_drafts"], 1, "{body}");
+    let item = &body["items"][0];
+    assert_eq!(item["lead"]["id"], lead_id);
+    assert_eq!(item["comments"].as_array().expect("comments").len(), 0);
+    assert!(!item["lead"]["content_snippet"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty());
+
+    // One call prepares the next drafts (queued, not generated inline).
+    let (status, body) = post(&app, "/api/v1/reply-console/prepare", json!({"limit": 1})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["queued"], 1);
+    lead_radar::worker::drain(&app.state, 20)
+        .await
+        .expect("drain");
+
+    let (status, body) = get(&app, "/api/v1/reply-console?limit=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stats"]["ready"], 1, "{body}");
+    assert_eq!(
+        body["items"][0]["comments"]
+            .as_array()
+            .expect("comments")
+            .len(),
+        3
+    );
+
+    // One call approves, records the manual publication and the engagement.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply"),
+        json!({"variant": "helpful", "engagement_kind": "reply", "note": "answered in the thread"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["comment"]["status"], "published_manually");
+    assert_eq!(body["engagement"]["kind"], "reply");
+
+    // The same draft cannot be recorded twice.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply"),
+        json!({"variant": "helpful"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Editing from the console creates a new version before publishing.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply"),
+        json!({"variant": "soft_pitch", "body": "Disclosure: I work on VoxTranslate. For live interviews, real-time translation keeps the conversation natural and avoids scheduling an interpreter."}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["comment"]["version"], 2);
+    assert_eq!(body["comment"]["status"], "published_manually");
+
+    // A missing variant is refused with a clear conflict.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply"),
+        json!({"variant": "direct_pitch", "body": "Disclosure: I work on VoxTranslate. It translates speech live during the interview."}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn a_bootstrap_token_authenticates_from_the_database() {
     let token = "bootstrap-token-with-enough-length-123456";
     let app = common::setup_with_vars(&[("BOOTSTRAP_API_TOKEN", token)]).await;

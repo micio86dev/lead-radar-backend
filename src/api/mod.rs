@@ -33,6 +33,15 @@ pub fn router(state: SharedState) -> Router {
         )
         // Opportunities
         .route("/opportunities", get(opportunities::list))
+        .route("/reply-console", get(opportunities::reply_console))
+        .route(
+            "/reply-console/prepare",
+            post(opportunities::prepare_drafts),
+        )
+        .route(
+            "/opportunities/{id}/reply",
+            post(opportunities::record_reply),
+        )
         .route(
             "/opportunities/{id}",
             get(opportunities::detail).delete(opportunities::remove),
@@ -191,6 +200,9 @@ pub async fn build_state(config: crate::config::AppConfig) -> anyhow::Result<Arc
         system::get_settings,
         system::patch_settings,
         opportunities::list,
+        opportunities::reply_console,
+        opportunities::prepare_drafts,
+        opportunities::record_reply,
         opportunities::detail,
         opportunities::analyze,
         opportunities::generate_comments,
