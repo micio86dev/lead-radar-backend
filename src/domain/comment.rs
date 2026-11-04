@@ -33,6 +33,36 @@ pub const PROMOTIONAL_PHRASES: [&str; 6] = [
     "pricing plans",
 ];
 
+/// Language that makes a reply look machine-written or like an advert. A person answering a thread
+/// does not say these things; a model that has not been constrained almost always does. The list is
+/// deliberately blunt: a rejected draft costs one regeneration, a ban costs the account.
+pub const MACHINE_PHRASES: [&str; 24] = [
+    "i hope this helps",
+    "hope this helps",
+    "it's important to note",
+    "it is important to note",
+    "in today's fast",
+    "in the ever-evolving",
+    "navigating the complexities",
+    "delve",
+    "leverage",
+    "seamless",
+    "cutting-edge",
+    "game-changer",
+    "game changer",
+    "revolutionize",
+    "unlock the",
+    "empower",
+    "elevate your",
+    "furthermore",
+    "moreover",
+    "in conclusion",
+    "i'd be happy to",
+    "feel free to reach out",
+    "let me know if you have any questions",
+    "espero que esto te ayude",
+];
+
 /// Affiliation can be disclosed in the discussion's language; these are the accepted forms.
 pub const DISCLOSURE_MARKERS: [&str; 15] = [
     "i work on",
@@ -73,12 +103,29 @@ pub struct CommentDraft {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "issue", rename_all = "snake_case")]
 pub enum CommentIssue {
-    TooShort { min: usize },
-    TooLong { max: usize },
+    TooShort {
+        min: usize,
+    },
+    TooLong {
+        max: usize,
+    },
     MissingAffiliationDisclosure,
-    PromotionalLanguageInHelpful { phrase: String },
-    ForbiddenClaim { phrase: String },
-    LanguageMismatch { expected: String, detected: String },
+    PromotionalLanguageInHelpful {
+        phrase: String,
+    },
+    ForbiddenClaim {
+        phrase: String,
+    },
+    /// The reply reads like a model wrote it, not like a person in the thread.
+    MachinePhrasing {
+        phrase: String,
+    },
+    /// The helpful variant mentioned the product, which turns advice into an advert.
+    ProductMentionInHelpful,
+    LanguageMismatch {
+        expected: String,
+        detected: String,
+    },
 }
 
 /// Validate one generated draft. Empty result means the draft may be stored (still as a draft).
@@ -113,6 +160,37 @@ pub fn validate(draft: &CommentDraft) -> Vec<CommentIssue> {
                     phrase: phrase.to_string(),
                 });
             }
+        }
+        if lowered.contains("voxtranslate") {
+            issues.push(CommentIssue::ProductMentionInHelpful);
+        }
+    }
+
+    for phrase in MACHINE_PHRASES {
+        if lowered.contains(phrase) {
+            issues.push(CommentIssue::MachinePhrasing {
+                phrase: phrase.to_string(),
+            });
+        }
+    }
+    if body.contains("!!") {
+        issues.push(CommentIssue::MachinePhrasing {
+            phrase: "double exclamation mark".to_string(),
+        });
+    }
+    for emoji in [
+        "\u{1F680}",
+        "\u{2705}",
+        "\u{1F4A1}",
+        "\u{1F3AF}",
+        "\u{1F525}",
+        "\u{2728}",
+    ] {
+        if body.contains(emoji) {
+            issues.push(CommentIssue::MachinePhrasing {
+                phrase: "emoji".to_string(),
+            });
+            break;
         }
     }
 
@@ -313,5 +391,78 @@ mod transition_tests {
         assert!(!publication_allowed(CommentStatus::PendingReview));
         assert!(publication_allowed(CommentStatus::Approved));
         assert!(!rejection_allowed(CommentStatus::PublishedManually));
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+
+    fn draft(variant: CommentVariant, body: &str) -> CommentDraft {
+        CommentDraft {
+            variant,
+            language: "en".to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_reply_that_sounds_like_a_person_passes() {
+        let issues = validate(&draft(
+            CommentVariant::Helpful,
+            "We ran into this last year with a 40 person onboarding. What fixed it for us was \
+             putting the glossary in the room before the meeting, not after. Depends how much of \
+             your terminology is internal though.",
+        ));
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn machine_voice_is_rejected() {
+        for body in [
+            "It's important to note that live translation is a game-changer for global teams. \
+             I hope this helps!",
+            "Furthermore, you could leverage a seamless platform to unlock the potential of your \
+             conferences.",
+            "Great question! Feel free to reach out if you have any questions and I'd be happy to \
+             walk you through it.",
+        ] {
+            let issues = validate(&draft(CommentVariant::Helpful, body));
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| matches!(issue, CommentIssue::MachinePhrasing { .. })),
+                "{body} -> {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_helpful_reply_that_names_the_product_is_not_helpful() {
+        let issues = validate(&draft(
+            CommentVariant::Helpful,
+            "You should look at VoxTranslate for this, it handles the audio path from the console.",
+        ));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue, CommentIssue::ProductMentionInHelpful)),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_pitch_still_needs_its_disclosure() {
+        let issues = validate(&draft(
+            CommentVariant::SoftPitch,
+            "For a conference that size the console feed matters more than the app. Worth a look \
+             at the options that take a line in.",
+        ));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue, CommentIssue::MissingAffiliationDisclosure)),
+            "{issues:?}"
+        );
     }
 }

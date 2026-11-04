@@ -122,6 +122,13 @@ pub async fn create_community(
 pub struct CommunityPatchBody {
     pub enabled: Option<bool>,
     pub notes: Option<String>,
+    /// allowed | ask_mods | forbidden | unknown. `unknown` is not permission.
+    pub self_promotion: Option<String>,
+    pub min_account_age_days: Option<i64>,
+    pub min_comment_karma: Option<i64>,
+    pub flair_required: Option<bool>,
+    pub promo_cooldown_days: Option<i64>,
+    pub rules_summary: Option<String>,
 }
 
 #[utoipa::path(patch, path = "/api/v1/communities/{id}", tag = "communities", responses((status = 200, description = "Updated community"), (status = 409, description = "Cannot enable an unvalidated community")))]
@@ -148,6 +155,12 @@ pub async fn patch_community(
         &sources::CommunityPatch {
             enabled: body.enabled,
             notes: body.notes.as_deref(),
+            self_promotion: body.self_promotion.as_deref(),
+            min_account_age_days: body.min_account_age_days,
+            min_comment_karma: body.min_comment_karma,
+            flair_required: body.flair_required,
+            promo_cooldown_days: body.promo_cooldown_days,
+            rules_summary: body.rules_summary.as_deref(),
         },
     )
     .await?

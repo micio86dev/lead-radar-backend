@@ -48,6 +48,13 @@ fn vertical_keywords() -> Vec<(Vertical, Vec<&'static str>)> {
                 "bilingual candidates",
                 "interpreter interview",
                 "translation interview",
+                // Evidenced 2026-11-04: a real r/humanresources thread asked "How do you support
+                // non-English speakers / readers?" and was dropped because no seeded phrase matched
+                // how practitioners actually write about the problem.
+                "non english speakers",
+                "english speaking staff",
+                "language support",
+                "translation service",
                 "multilingual hiring",
                 "multilingual",
                 "bilingual",
@@ -374,6 +381,9 @@ pub async fn seed_all(config: &AppConfig, db: &Db) -> anyhow::Result<SeedReport>
         }
         report.profiles += 1;
         report.keywords += keywords.len();
+        report.keywords +=
+            sources::ensure_keywords(db, &tenant_id, vertical.as_str(), &keywords, "positive")
+                .await?;
     }
     for term in negative_keywords() {
         sqlx::query(

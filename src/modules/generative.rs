@@ -278,9 +278,19 @@ fn policy_rules(language: &str) -> String {
          - soft_pitch and direct_pitch must name VoxTranslate and open with an affiliation \
          disclosure. Use the documented form for the language: {examples}\n\
          - Never use any of these phrases: {}.\n\
-         - The helpful variant must stay non-promotional and must not contain: {}.",
+         - The helpful variant must stay non-promotional, must not name the product, and must not \
+         contain: {}.\n\
+         Voice — a draft that fails these is rejected too: write the way a person types in a \
+         forum, in plain words and contractions, two to four sentences, no headings, no bullet \
+         lists, no emoji, no exclamation marks. Open with the concrete answer to what was asked, \
+         not with a preamble about the topic. Say something specific to this thread, including one \
+         detail only this thread would produce. Allow a mild opinion or an honest limit (\"depends \
+         on\", \"not sure\", \"that bit I have not tried\"). Never offer to help further, never ask \
+         for a DM, never suggest a call, never sound enthusiastic about a product. Never use any of \
+         these phrases: {}.",
         crate::domain::comment::FORBIDDEN_PHRASES.join(", "),
         crate::domain::comment::PROMOTIONAL_PHRASES.join(", "),
+        crate::domain::comment::MACHINE_PHRASES.join(", "),
     )
 }
 
@@ -339,6 +349,45 @@ async fn validate_and_store(
     Ok(rejected)
 }
 
+/// The rules the community itself published, phrased so the model writes what the moderators allow.
+///
+/// The publication path enforces the same policy, so a prompt that ignores this block cannot turn
+/// into a recorded pitch — but a prompt that respects it produces a draft a human can actually use.
+async fn engagement_rules(state: &AppState, tenant_id: &str, community: Option<&str>) -> String {
+    let policy = match community {
+        Some(name) => crate::modules::sources::community_policy_by_name(&state.db, tenant_id, name)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let Some(policy) = policy else {
+        return "COMMUNITY RULES: this community has no recorded policy. Promotion is not allowed: \
+                write the helpful variant only and do not name the product."
+            .to_string();
+    };
+    format!(
+        "COMMUNITY RULES (r/{name}): promotion {promotion}; minimum account age {age} days; \
+minimum comment karma {karma}; flair required {flair}; wait {cooldown} days between promotional \
+replies. Recorded rules: {rules}\n\
+Hard rules: answer the question first and in the discussion's own terms. Name the product only \
+when promotion is allowed, in at most one sentence, with the affiliation disclosure. Never list \
+features, prices, integrations or capabilities, never quote customer stories, and never answer \
+with marketing phrasing.",
+        name = policy.name,
+        promotion = policy.self_promotion,
+        age = policy.min_account_age_days,
+        karma = policy.min_comment_karma,
+        flair = if policy.flair_required { "yes" } else { "no" },
+        cooldown = policy.promo_cooldown_days,
+        rules = if policy.rules_summary.is_empty() {
+            "none recorded"
+        } else {
+            &policy.rules_summary
+        },
+    )
+}
+
 /// Draft the three comment variants for a lead. Only drafts that satisfy the comment policy are
 /// stored, and they are stored as `pending_review`: no publication path exists in code.
 pub async fn generate_comments(
@@ -369,6 +418,7 @@ personal experience, testimonials, pricing or integrations. Answer with JSON onl
     // The prompt quotes the same rules the validator enforces, so the model is never asked to guess
     // them and the two cannot drift apart.
     let policy = policy_rules(&language);
+    let engagement = engagement_rules(state, tenant_id, lead.community.as_deref()).await;
     let user = format!(
         "{}\n\n{}\n\nlanguage: {}\n\n{}\n\nProduce exactly three variants as JSON: \
 {{\"variants\":[{{\"variant\":\"helpful\",\"body\":\"...\"}},{{\"variant\":\"soft_pitch\",\
@@ -379,6 +429,7 @@ paragraph between 40 and 1200 characters.",
         language,
         policy,
     );
+    let user = format!("{user}\n\n{engagement}");
 
     if let Some(false) =
         crate::modules::tenancy::provider_toggle(&state.db, tenant_id, "qwen").await?

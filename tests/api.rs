@@ -781,6 +781,25 @@ async fn the_reply_console_queues_drafts_and_records_a_manual_reply_in_one_call(
         3
     );
 
+    // Recording a pitch as published requires the community's promotion policy on file first.
+    let (_, communities) = get(&app, "/api/v1/communities?per_page=100").await;
+    let community_id = communities["items"]
+        .as_array()
+        .expect("communities")
+        .iter()
+        .find(|community| community["name"] == "recruiting")
+        .expect("recruiting community")["id"]
+        .as_str()
+        .expect("community id")
+        .to_string();
+    let (status, body) = patch(
+        &app,
+        &format!("/api/v1/communities/{community_id}"),
+        json!({"self_promotion": "allowed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
     // One call approves, records the manual publication and the engagement.
     let (status, body) = post(
         &app,
@@ -940,6 +959,161 @@ async fn seeds_are_idempotent() {
         .expect("second seed");
     let after = counts(&app).await;
     assert_eq!(before, after, "seed must not duplicate rows");
+}
+
+#[tokio::test]
+async fn a_pitch_is_not_recorded_as_published_until_the_community_allows_it() {
+    let app = setup().await;
+    let lead_id = import_and_lead(&app).await;
+
+    // Drafts exist; pick the soft pitch, which is the variant that can get an account banned.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/generate-comments"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+
+    lead_radar::worker::drain(&app.state, 20)
+        .await
+        .expect("drain");
+    let (_, comments) = get(&app, &format!("/api/v1/comments?lead_id={lead_id}")).await;
+    let pitch = comments["items"]
+        .as_array()
+        .expect("comments")
+        .iter()
+        .find(|comment| comment["variant"] == "soft_pitch")
+        .expect("soft pitch draft")
+        .clone();
+    let comment_id = pitch["id"].as_str().expect("comment id").to_string();
+
+    let (status, _) = post(
+        &app,
+        &format!("/api/v1/comments/{comment_id}/approve"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(status.is_success());
+
+    // The seeded community is 'pending' with no recorded promotion policy: unknown is not permission.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/comments/{comment_id}/record-publication"),
+        serde_json::json!({"note": "posted by hand"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Recording that the moderators allow promotion unblocks the same reply.
+    let (_, communities) = get(&app, "/api/v1/communities?per_page=100").await;
+    let recruiting = communities["items"]
+        .as_array()
+        .expect("communities")
+        .iter()
+        .find(|community| community["name"] == "recruiting")
+        .expect("recruiting community")
+        .clone();
+    let community_id = recruiting["id"].as_str().expect("community id").to_string();
+    let (status, body) = patch(
+        &app,
+        &format!("/api/v1/communities/{community_id}"),
+        serde_json::json!({"self_promotion": "allowed", "rules_summary": "self-promotion allowed with disclosure"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["self_promotion"], "allowed");
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/comments/{comment_id}/record-publication"),
+        serde_json::json!({"note": "posted by hand"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "published_manually");
+}
+
+#[tokio::test]
+async fn seeding_reconciles_keywords_a_profile_was_missing() {
+    let app = setup().await;
+    let config = app.state.config.clone();
+
+    // A keyword added to the seed after the profile already existed used to be lost forever,
+    // because the seed only wrote keywords while creating a missing profile.
+    sqlx::query("DELETE FROM keywords WHERE term = 'non english speakers'")
+        .execute(&app.db().writer)
+        .await
+        .expect("remove keyword");
+    let missing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM keywords WHERE term = 'non english speakers'")
+            .fetch_one(&app.db().reader)
+            .await
+            .expect("count");
+    assert_eq!(missing, 0);
+
+    seed::seed_all(&config, app.db())
+        .await
+        .expect("reconcile seed");
+
+    let restored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM keywords WHERE term = 'non english speakers'")
+            .fetch_one(&app.db().reader)
+            .await
+            .expect("count");
+    assert_eq!(restored, 1);
+
+    // Running it again is still idempotent: no duplicates.
+    seed::seed_all(&config, app.db())
+        .await
+        .expect("second reconcile");
+    let again: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM keywords WHERE term = 'non english speakers'")
+            .fetch_one(&app.db().reader)
+            .await
+            .expect("count");
+    assert_eq!(again, 1);
+}
+
+#[tokio::test]
+async fn language_support_posts_pass_the_seeded_filter_and_study_posts_do_not() {
+    use lead_radar::domain::enums::Vertical;
+    use lead_radar::domain::filtering::{evaluate, KeywordSet};
+
+    let (positive, negative) = seed::keyword_terms();
+    let mut keywords = KeywordSet::default();
+    for term in &negative {
+        keywords.add_negative(term);
+    }
+    for vertical in [
+        Vertical::HrRecruiting,
+        Vertical::InternationalMeetings,
+        Vertical::ConferencesWebinars,
+        Vertical::CustomerSupport,
+        Vertical::TourismHospitality,
+        Vertical::Other,
+    ] {
+        for term in &positive {
+            keywords.add_positive(vertical, term);
+        }
+    }
+
+    // The real thread this rule was written for: an HR practitioner asking how to support
+    // non-English speakers at work.
+    let support = evaluate(
+        "How do you support non-English speakers / readers? We have significant populations of \
+         Spanish and Vietnamese speakers. Everyone knows enough English to work safely.",
+        &keywords,
+    );
+    assert!(support.relevant, "{support:?}");
+
+    // Off-topic language-study content stays out, including the negative keyword case.
+    let homework = evaluate(
+        "I need help with my translation homework, it is a grammar exercise for my language \
+         learning class.",
+        &keywords,
+    );
+    assert!(!homework.relevant, "{homework:?}");
 }
 
 async fn counts(app: &common::TestApp) -> (i64, i64, i64, i64) {

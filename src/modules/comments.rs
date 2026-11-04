@@ -364,6 +364,34 @@ pub async fn record_publication(
             current.as_str()
         )));
     }
+    // A pitch is the one kind of reply that can get an account banned. It is recorded as published
+    // only when the operator has established that the community allows promotion: `unknown` is not
+    // permission, and neither is a stale assumption.
+    if matches!(comment.variant.as_str(), "soft_pitch" | "direct_pitch") {
+        let community = community_of_lead(db, tenant_id, &comment.lead_id)
+            .await
+            .map_err(|_| CommentError::InvalidTransition("database error".to_string()))?;
+        let policy = match community.as_deref() {
+            Some(name) => crate::modules::sources::community_policy_by_name(db, tenant_id, name)
+                .await
+                .map_err(|_| CommentError::InvalidTransition("database error".to_string()))?,
+            None => None,
+        };
+        let allowed = policy
+            .as_ref()
+            .map(|community| community.self_promotion.as_str() == "allowed")
+            .unwrap_or(false);
+        if !allowed {
+            let status = policy
+                .map(|community| community.self_promotion)
+                .unwrap_or_else(|| "unknown (community not registered)".to_string());
+            return Err(CommentError::InvalidTransition(format!(
+                "self-promotion_status={status}: record that this community allows promotion before \
+                 publishing a pitch, or publish the helpful variant instead"
+            )));
+        }
+    }
+
     let published_at = published_at.map(str::to_string).unwrap_or_else(now_iso);
     sqlx::query(
         "UPDATE generated_comments SET status = 'published_manually', published_at = ?, \
@@ -460,6 +488,20 @@ pub fn summary(row: CommentRow) -> serde_json::Value {
 
 pub fn to_json_string(value: &serde_json::Value) -> String {
     to_json(value)
+}
+
+/// The community a lead was collected from, used to resolve its engagement policy.
+async fn community_of_lead(
+    db: &Db,
+    tenant_id: &str,
+    lead_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT community FROM leads WHERE tenant_id = ? AND id = ?")
+        .bind(tenant_id)
+        .bind(lead_id)
+        .fetch_optional(&db.reader)
+        .await
+        .map(|row| row.flatten())
 }
 
 #[cfg(test)]

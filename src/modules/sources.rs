@@ -192,6 +192,43 @@ pub async fn create_search_profile(
         .ok_or(sqlx::Error::RowNotFound)
 }
 
+/// Add keywords that a profile is missing, without touching the ones it has.
+///
+/// The seed creates a profile's keyword set only when the profile itself is missing, so a keyword
+/// added to the seed list later never reached an existing database. This is the reconciliation step:
+/// idempotent, additive, and it never deletes an operator's own keywords.
+pub async fn ensure_keywords(
+    db: &Db,
+    tenant_id: &str,
+    vertical: &str,
+    terms: &[&str],
+    polarity: &str,
+) -> Result<usize, sqlx::Error> {
+    let mut tx = db.writer.begin().await?;
+    let mut added = 0usize;
+    for term in terms {
+        let trimmed = term.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let result = sqlx::query(
+            "INSERT INTO keywords (id, tenant_id, vertical, term, polarity, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(tenant_id, vertical, term, polarity) DO NOTHING",
+        )
+        .bind(new_id())
+        .bind(tenant_id)
+        .bind(vertical)
+        .bind(trimmed)
+        .bind(polarity)
+        .bind(now_iso())
+        .execute(&mut *tx)
+        .await?;
+        added += result.rows_affected() as usize;
+    }
+    tx.commit().await?;
+    Ok(added)
+}
+
 async fn insert_keyword(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     tenant_id: &str,
@@ -331,6 +368,14 @@ pub struct Community {
     pub notes: Option<String>,
     pub last_checked_at: Option<String>,
     pub created_at: String,
+    /// What the moderators published about promotion: allowed, ask_mods, forbidden or unknown.
+    /// `unknown` is not permission.
+    pub self_promotion: String,
+    pub min_account_age_days: i64,
+    pub min_comment_karma: i64,
+    pub flair_required: bool,
+    pub promo_cooldown_days: i64,
+    pub rules_summary: String,
 }
 
 #[derive(FromRow)]
@@ -343,6 +388,12 @@ struct CommunityRow {
     notes: Option<String>,
     last_checked_at: Option<String>,
     created_at: String,
+    self_promotion: String,
+    min_account_age_days: i64,
+    min_comment_karma: i64,
+    flair_required: i64,
+    promo_cooldown_days: i64,
+    rules_summary: String,
 }
 
 impl From<CommunityRow> for Community {
@@ -356,6 +407,12 @@ impl From<CommunityRow> for Community {
             notes: row.notes,
             last_checked_at: row.last_checked_at,
             created_at: row.created_at,
+            self_promotion: row.self_promotion,
+            min_account_age_days: row.min_account_age_days,
+            min_comment_karma: row.min_comment_karma,
+            flair_required: row.flair_required != 0,
+            promo_cooldown_days: row.promo_cooldown_days,
+            rules_summary: row.rules_summary,
         }
     }
 }
@@ -369,7 +426,9 @@ pub async fn list_communities(
     offset: i64,
 ) -> Result<(Vec<Community>, i64), sqlx::Error> {
     let rows = sqlx::query_as::<_, CommunityRow>(
-        "SELECT id, name, vertical, validation_status, enabled, notes, last_checked_at, created_at \
+        "SELECT id, name, vertical, validation_status, enabled, notes, last_checked_at, created_at, \
+                self_promotion, min_account_age_days, min_comment_karma, flair_required, \
+                promo_cooldown_days, rules_summary \
          FROM communities WHERE tenant_id = ? AND (? IS NULL OR vertical = ?) \
          AND (? IS NULL OR validation_status = ?) ORDER BY vertical, name LIMIT ? OFFSET ?",
     )
@@ -435,7 +494,9 @@ pub async fn get_community(
     id: &str,
 ) -> Result<Option<Community>, sqlx::Error> {
     let row = sqlx::query_as::<_, CommunityRow>(
-        "SELECT id, name, vertical, validation_status, enabled, notes, last_checked_at, created_at \
+        "SELECT id, name, vertical, validation_status, enabled, notes, last_checked_at, created_at, \
+                self_promotion, min_account_age_days, min_comment_karma, flair_required, \
+                promo_cooldown_days, rules_summary \
          FROM communities WHERE tenant_id = ? AND id = ?",
     )
     .bind(tenant_id)
@@ -448,6 +509,12 @@ pub async fn get_community(
 pub struct CommunityPatch<'a> {
     pub enabled: Option<bool>,
     pub notes: Option<&'a str>,
+    pub self_promotion: Option<&'a str>,
+    pub min_account_age_days: Option<i64>,
+    pub min_comment_karma: Option<i64>,
+    pub flair_required: Option<bool>,
+    pub promo_cooldown_days: Option<i64>,
+    pub rules_summary: Option<&'a str>,
 }
 
 pub async fn patch_community(
@@ -478,7 +545,98 @@ pub async fn patch_community(
         .execute(&db.writer)
         .await?;
     }
+    if let Some(self_promotion) = patch.self_promotion {
+        sqlx::query(
+            "UPDATE communities SET self_promotion = ?, updated_at = ? WHERE id = ? \
+             AND tenant_id = ?",
+        )
+        .bind(self_promotion)
+        .bind(now_iso())
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(days) = patch.min_account_age_days {
+        sqlx::query(
+            "UPDATE communities SET min_account_age_days = ?, updated_at = ? WHERE id = ? \
+             AND tenant_id = ?",
+        )
+        .bind(days.max(0))
+        .bind(now_iso())
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(karma) = patch.min_comment_karma {
+        sqlx::query(
+            "UPDATE communities SET min_comment_karma = ?, updated_at = ? WHERE id = ? \
+             AND tenant_id = ?",
+        )
+        .bind(karma.max(0))
+        .bind(now_iso())
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(required) = patch.flair_required {
+        sqlx::query(
+            "UPDATE communities SET flair_required = ?, updated_at = ? WHERE id = ? \
+             AND tenant_id = ?",
+        )
+        .bind(if required { 1 } else { 0 })
+        .bind(now_iso())
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(days) = patch.promo_cooldown_days {
+        sqlx::query(
+            "UPDATE communities SET promo_cooldown_days = ?, updated_at = ? WHERE id = ? \
+             AND tenant_id = ?",
+        )
+        .bind(days.max(0))
+        .bind(now_iso())
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
+    if let Some(summary) = patch.rules_summary {
+        sqlx::query(
+            "UPDATE communities SET rules_summary = ?, updated_at = ? WHERE id = ? \
+             AND tenant_id = ?",
+        )
+        .bind(summary)
+        .bind(now_iso())
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&db.writer)
+        .await?;
+    }
     get_community(db, tenant_id, id).await
+}
+
+/// The engagement policy of the community a lead belongs to, if that community is registered.
+pub async fn community_policy_by_name(
+    db: &Db,
+    tenant_id: &str,
+    name: &str,
+) -> Result<Option<Community>, sqlx::Error> {
+    let row = sqlx::query_as::<_, CommunityRow>(
+        "SELECT id, name, vertical, validation_status, enabled, notes, last_checked_at, created_at, \
+                self_promotion, min_account_age_days, min_comment_karma, flair_required, \
+                promo_cooldown_days, rules_summary \
+         FROM communities WHERE tenant_id = ? AND lower(name) = lower(?) LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(name)
+    .fetch_optional(&db.reader)
+    .await?;
+    Ok(row.map(Community::from))
 }
 
 /// Record a validation outcome. Enabling stays a separate, explicit step.
