@@ -54,6 +54,18 @@ async fn main() -> anyhow::Result<()> {
             seed::reset_data(&db).await?;
             println!("database reset");
         }
+        Some("prune-tokens") => {
+            let token = config.bootstrap_api_token.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("BOOTSTRAP_API_TOKEN is not set; it defines the token to keep")
+            })?;
+            let removed = lead_radar::modules::tenancy::prune_bootstrap_tokens(
+                &db,
+                &config.default_tenant_id,
+                &lead_radar::auth::hash_token(token),
+            )
+            .await?;
+            println!("removed {removed} stale bootstrap token(s)");
+        }
         Some("rescore") => {
             let outcome = lead_radar::modules::qualification::rescore_tenant(
                 &db,
@@ -75,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         }
         other => {
             anyhow::bail!(
-                "unknown command {other:?}; use migrate, seed, rescore, purge [days], reset --confirm, token <value>, settings"
+                "unknown command {other:?}; use migrate, seed, rescore, prune-tokens, purge [days], reset --confirm, token <value>, settings"
             )
         }
     }

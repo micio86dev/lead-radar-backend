@@ -13,6 +13,12 @@ WORKER_BIN=/usr/local/bin/worker
 "$DB_BIN" migrate
 "$DB_BIN" seed
 
+# The token in the environment is the single source of truth: a rotation invalidates the previous
+# bootstrap hash on the next start instead of leaving it usable forever.
+if [ -n "${BOOTSTRAP_API_TOKEN:-}" ]; then
+  "$DB_BIN" prune-tokens || true
+fi
+
 "$WORKER_BIN" &
 WORKER_PID=$!
 

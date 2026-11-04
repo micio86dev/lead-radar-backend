@@ -707,6 +707,47 @@ async fn a_bootstrap_token_authenticates_from_the_database() {
 }
 
 #[tokio::test]
+async fn rotating_the_bootstrap_token_can_be_pruned_explicitly() {
+    let token = "rotated-bootstrap-token-1234567890abcd";
+    let app = common::setup_with_vars(&[("BOOTSTRAP_API_TOKEN", token)]).await;
+    // Simulate a previous bootstrap token left behind by a rotation.
+    sqlx::query(
+        "INSERT INTO api_tokens (id, tenant_id, user_id, token_hash, label, created_at) \
+         VALUES (?, ?, ?, ?, 'bootstrap (environment)', ?)",
+    )
+    .bind("stale-token-row")
+    .bind(app.tenant())
+    .bind(lead_radar::seed::DEV_USER_ID)
+    .bind(lead_radar::auth::hash_token(
+        "previous-bootstrap-token-000000000000",
+    ))
+    .bind(lead_radar::domain::time::now_iso())
+    .execute(&app.db().writer)
+    .await
+    .expect("stale token");
+
+    let removed = lead_radar::modules::tenancy::prune_bootstrap_tokens(
+        app.db(),
+        app.tenant(),
+        &lead_radar::auth::hash_token(token),
+    )
+    .await
+    .expect("prune");
+    assert_eq!(removed, 1);
+
+    // The current token still works; the stale one is gone.
+    let (status, _) = get_as(&app, "/api/v1/dashboard", token).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get_as(
+        &app,
+        "/api/v1/dashboard",
+        "previous-bootstrap-token-000000000000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn seeds_are_idempotent() {
     let app = setup().await;
     let config = app.state.config.clone();

@@ -177,3 +177,21 @@ pub async fn provider_toggle(
             .and_then(|flag| flag.as_bool())
     }))
 }
+
+/// Remove bootstrap tokens other than the one currently configured. Rotation leaves the previous hash
+/// valid until it is deleted; there is no token-management UI in the MVP, so this is the explicit step.
+pub async fn prune_bootstrap_tokens(
+    db: &Db,
+    tenant_id: &str,
+    keep_hash: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM api_tokens WHERE tenant_id = ? AND label = 'bootstrap (environment)' \
+         AND token_hash != ?",
+    )
+    .bind(tenant_id)
+    .bind(keep_hash)
+    .execute(&db.writer)
+    .await?;
+    Ok(result.rows_affected())
+}
