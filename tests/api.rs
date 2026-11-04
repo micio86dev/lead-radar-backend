@@ -774,6 +774,63 @@ async fn the_reply_console_queues_drafts_and_records_a_manual_reply_in_one_call(
 }
 
 #[tokio::test]
+async fn the_console_matches_a_reddit_url_for_the_extension() {
+    let app = setup().await;
+    let lead_id = import_and_lead(&app).await;
+
+    // Normalisation ignores a trailing slash and query parameters.
+    let (status, body) = get(
+        &app,
+        "/api/v1/reply-console/match?url=https://example.invalid/discussion/1/?utm_source=x",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lead"]["id"], lead_id);
+    assert_eq!(body["comments"].as_array().expect("comments").len(), 0);
+
+    let (status, _) = get(
+        &app,
+        "/api/v1/reply-console/match?url=https://example.invalid/not-our-post",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn automatic_preparation_is_bounded_and_rate_limited() {
+    let app = setup().await;
+    import_and_lead(&app).await;
+
+    let (status, first) = post(
+        &app,
+        "/api/v1/reply-console/prepare",
+        json!({"limit": 3, "auto": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    assert_eq!(first["queued"], 1);
+
+    // A page refresh inside the cooldown window must not queue paid generation again.
+    let (status, second) = post(
+        &app,
+        "/api/v1/reply-console/prepare",
+        json!({"limit": 3, "auto": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{second}");
+    assert_eq!(second["queued"], 0);
+    assert_eq!(second["cooldown_minutes"], 10);
+
+    // The explicit button bypasses the cooldown.
+    lead_radar::worker::drain(&app.state, 20)
+        .await
+        .expect("drain");
+    let (status, forced) = post(&app, "/api/v1/reply-console/prepare", json!({"limit": 3})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{forced}");
+    assert_eq!(forced["queued"], 0, "the lead already has drafts");
+}
+
+#[tokio::test]
 async fn a_bootstrap_token_authenticates_from_the_database() {
     let token = "bootstrap-token-with-enough-length-123456";
     let app = common::setup_with_vars(&[("BOOTSTRAP_API_TOKEN", token)]).await;

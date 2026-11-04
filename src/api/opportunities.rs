@@ -347,6 +347,73 @@ pub async fn reply_console(
     })))
 }
 
+/// Normalise a Reddit URL so the extension can find the lead from the page it is on.
+fn normalize_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query.trim_end_matches('/').to_lowercase()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatchQuery {
+    pub url: String,
+}
+
+#[utoipa::path(get, path = "/api/v1/reply-console/match", tag = "opportunities", responses((status = 200, description = "Queue item for the current page"), (status = 404, description = "No lead for this URL")))]
+pub async fn reply_console_match(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Query(query): Query<MatchQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let tenant = &context.tenant_id;
+    let wanted = normalize_url(&query.url);
+    if wanted.is_empty() {
+        return Err(AppError::BadRequest("url is required".to_string()));
+    }
+    let row = sqlx::query_as::<_, qualification::LeadRow>(
+        "SELECT l.*, s.name AS source_name, \
+         (SELECT COUNT(*) FROM generated_comments c WHERE c.lead_id = l.id) AS comment_count \
+         FROM leads l LEFT JOIN sources s ON s.id = l.source_id \
+         WHERE l.tenant_id = ? AND l.is_active = 1 AND l.source_url IS NOT NULL \
+         ORDER BY l.updated_at DESC LIMIT 200",
+    )
+    .bind(tenant)
+    .fetch_all(&state.db.reader)
+    .await?
+    .into_iter()
+    .find(|lead| {
+        lead.source_url
+            .as_deref()
+            .map(normalize_url)
+            .map(|url| url == wanted)
+            .unwrap_or(false)
+    })
+    .ok_or(AppError::NotFound)?;
+
+    let comment_rows = comments::comments_for_lead(&state.db, tenant, &row.id).await?;
+    let post = crate::modules::ingestion::get_post(&state.db, tenant, &row.post_id).await?;
+    let mut lead = lead_list_json(
+        &row,
+        qualification::lead_evidence(&row).len(),
+        row.comment_count,
+    );
+    lead["content_snippet"] = json!(post
+        .as_ref()
+        .map(|post| post.content.chars().take(700).collect::<String>())
+        .unwrap_or_default());
+    Ok(Json(json!({
+        "lead": lead,
+        "comments": comment_rows
+            .iter()
+            .map(|comment| comments::summary(comment.clone()))
+            .collect::<Vec<_>>(),
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReplyBody {
     pub variant: String,
@@ -487,7 +554,14 @@ fn map_comment_error(error: comments::CommentError) -> AppError {
 #[derive(Debug, Deserialize)]
 pub struct PrepareBody {
     pub limit: Option<i64>,
+    /// True when the console prepares drafts on page load: bounded to three and rate limited so a
+    /// refresh cannot queue paid generation repeatedly.
+    #[serde(default)]
+    pub auto: bool,
 }
+
+/// Minimum spacing between automatic preparations for one tenant.
+const AUTO_PREPARE_COOLDOWN_MINUTES: i64 = 10;
 
 #[utoipa::path(post, path = "/api/v1/reply-console/prepare", tag = "opportunities", responses((status = 202, description = "Comment drafts queued"), (status = 503, description = "Generative provider unconfigured")))]
 pub async fn prepare_drafts(
@@ -502,7 +576,27 @@ pub async fn prepare_drafts(
                 .to_string(),
         ));
     }
-    let limit = body.limit.unwrap_or(5).clamp(1, 10);
+    let mut limit = body.limit.unwrap_or(5).clamp(1, 10);
+    if body.auto {
+        limit = limit.min(3);
+        let last: Option<String> = sqlx::query_scalar(
+            "SELECT created_at FROM audit_logs WHERE tenant_id = ? \
+             AND action = 'reply_console_prepared' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(tenant)
+        .fetch_optional(&state.db.reader)
+        .await?;
+        if let Some(last) = last.and_then(|raw| crate::domain::time::parse_iso(&raw)) {
+            if (chrono::Utc::now() - last).num_minutes() < AUTO_PREPARE_COOLDOWN_MINUTES {
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(
+                        json!({ "queued": 0, "job_ids": [], "cooldown_minutes": AUTO_PREPARE_COOLDOWN_MINUTES }),
+                    ),
+                ));
+            }
+        }
+    }
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT l.id, l.post_id FROM leads l \
          WHERE l.tenant_id = ? AND l.is_active = 1 \
