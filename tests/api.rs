@@ -59,6 +59,55 @@ async fn import_pipeline_creates_one_qualified_lead() {
 }
 
 #[tokio::test]
+async fn deleted_and_removed_content_is_rejected_and_never_stored() {
+    let app = setup().await;
+    let mut deleted_title = relevant_post(&now_minus_hours(1));
+    deleted_title["external_id"] = "gone-title".into();
+    deleted_title["title"] = "[deleted]".into();
+
+    let mut removed_body = relevant_post(&now_minus_hours(1));
+    removed_body["external_id"] = "gone-body".into();
+    removed_body["content"] = "[removed]".into();
+
+    let mut deleted_author = relevant_post(&now_minus_hours(1));
+    deleted_author["external_id"] = "gone-author".into();
+    deleted_author["author"] = "[deleted]".into();
+
+    let (status, body) = post(
+        &app,
+        "/api/v1/import/json",
+        serde_json::json!({
+            "posts": [deleted_title, removed_body, deleted_author]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["imported"], 0, "{body}");
+    assert_eq!(body["rejected"], 3, "{body}");
+    assert_eq!(
+        body["rejected_reasons"][0],
+        "deleted or removed post: no author to answer, so it is not stored",
+        "{body}"
+    );
+
+    // Nothing reached storage, so nothing can reach the inbox or the reply queue either.
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM discovered_posts WHERE tenant_id = ? AND external_id LIKE 'gone-%'",
+    )
+    .bind(app.tenant())
+    .fetch_one(&app.db().reader)
+    .await
+    .expect("count");
+    assert_eq!(stored, 0);
+
+    lead_radar::worker::drain(&app.state, 20)
+        .await
+        .expect("drain");
+    let (_, leads) = get(&app, "/api/v1/opportunities").await;
+    assert_eq!(leads["total"], 0, "{leads}");
+}
+
+#[tokio::test]
 async fn duplicate_imports_do_not_create_a_second_lead() {
     let app = setup().await;
     let first = import_and_lead(&app).await;

@@ -178,6 +178,20 @@ pub async fn ensure_manual_source(db: &Db, tenant_id: &str) -> Result<String, sq
     Ok(id)
 }
 
+/// Reddit never really deletes a thread: it replaces the author, the title or the body with the
+/// `[deleted]` / `[removed]` tombstone. Such a thread cannot be answered — the page it points at has
+/// no author to reply to — so it is rejected instead of stored, and the operator sees the count.
+pub fn is_unanswerable(post: &ImportPost) -> bool {
+    const MARKERS: [&str; 2] = ["[deleted]", "[removed]"];
+    let is_marker = |value: &str| {
+        let trimmed = value.trim().to_ascii_lowercase();
+        MARKERS.contains(&trimmed.as_str())
+    };
+    post.author.as_deref().is_some_and(is_marker)
+        || post.title.as_deref().is_some_and(is_marker)
+        || is_marker(&post.content)
+}
+
 /// Import posts and enqueue the pipeline. Duplicates are counted, not stored twice.
 #[allow(clippy::too_many_arguments)]
 pub async fn import_posts(
@@ -217,6 +231,14 @@ pub async fn import_posts(
             rejected += 1;
             rejected_reasons.push("content must not be empty".to_string());
             insert_item(db, &run_id, None, "rejected", Some("empty content")).await?;
+            continue;
+        }
+        if is_unanswerable(post) {
+            rejected += 1;
+            rejected_reasons.push(
+                "deleted or removed post: no author to answer, so it is not stored".to_string(),
+            );
+            insert_item(db, &run_id, None, "rejected", Some("deleted content")).await?;
             continue;
         }
         let hash = content_hash(post.title.as_deref(), content);
