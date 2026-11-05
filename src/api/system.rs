@@ -80,6 +80,8 @@ pub async fn dashboard(
         comments::review_queue_counts(&state.db, tenant).await?;
     let (failed_jobs, dead_jobs) = operations::job_failure_counts(&state.db, tenant).await?;
     let usage = sources::apify_usage(&state.db, tenant).await?;
+    // Same source of truth as the guard, so the dashboard cannot show a ceiling the guard ignores.
+    let budgets = sources::effective_budgets(&state.db, tenant, &state.config).await;
     let statuses = provider_statuses(&state, tenant).await?;
     let costs =
         operations::provider_cost_summary(&state.db, tenant, operations::days_ago(now(), 30))
@@ -128,19 +130,19 @@ pub async fn dashboard(
         },
         "providers": statuses,
         "apify": {
-            "budget_eur": state.config.apify.total_budget_eur,
-            "daily_budget_eur": state.config.apify.daily_budget_eur,
+            "budget_eur": budgets.total_budget_eur,
+            "daily_budget_eur": budgets.daily_budget_eur,
             "known_actual_usd": usage.actual_spend_usd,
             "estimated_usd": usage.estimate_spend_usd,
             "remaining_known_eur": if usage.actual_spend_usd.is_some() {
                 serde_json::Value::Null
             } else {
-                serde_json::json!(state.config.apify.total_budget_eur)
+                serde_json::json!(budgets.total_budget_eur)
             },
             "runs": usage.runs_total,
             "results": usage.results_total,
             "errors": usage.errors_total,
-            "kill_switch": state.config.apify.kill_switch,
+            "kill_switch": budgets.kill_switch,
             "cost_source": if usage.actual_spend_usd.is_some() { "actual" }
                 else if usage.estimate_spend_usd.is_some() { "estimate" } else { "unknown" },
         },

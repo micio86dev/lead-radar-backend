@@ -390,6 +390,8 @@ pub async fn usage(
     context: TenantContext,
 ) -> AppResult<Json<serde_json::Value>> {
     let usage = sources::apify_usage(&state.db, &context.tenant_id).await?;
+    // The reporting surface must agree with the guard: operator overrides are what actually bounds a run.
+    let budgets = sources::effective_budgets(&state.db, &context.tenant_id, &state.config).await;
     let cost_source = if usage.actual_spend_usd.is_some() {
         "actual"
     } else if usage.estimate_spend_usd.is_some() {
@@ -398,23 +400,23 @@ pub async fn usage(
         "unknown"
     };
     Ok(Json(json!({
-        "budget_eur": state.config.apify.total_budget_eur,
-        "daily_budget_eur": state.config.apify.daily_budget_eur,
-        "max_run_cost_eur": state.config.apify.max_run_cost_eur,
-        "max_concurrent_runs": state.config.apify.max_concurrent_runs,
-        "max_items_per_run": state.config.apify.max_items_per_run,
+        "budget_eur": budgets.total_budget_eur,
+        "daily_budget_eur": budgets.daily_budget_eur,
+        "max_run_cost_eur": budgets.max_run_cost_eur,
+        "max_concurrent_runs": budgets.max_concurrent_runs,
+        "max_items_per_run": budgets.max_items_per_run,
         "known_actual_usd": usage.actual_spend_usd,
         "estimated_usd": usage.estimate_spend_usd,
         "remaining_known_eur": if usage.actual_spend_usd.is_some() {
             serde_json::Value::Null
         } else {
-            json!(state.config.apify.total_budget_eur)
+            json!(budgets.total_budget_eur)
         },
         "runs_total": usage.runs_total,
         "runs_running": usage.runs_running,
         "results_total": usage.results_total,
         "errors_total": usage.errors_total,
-        "kill_switch": state.config.apify.kill_switch,
+        "kill_switch": budgets.kill_switch,
         "cost_source": cost_source,
         "currency_note": "configured ceilings are EUR; Apify reports spend in USD and both are shown separately",
     })))

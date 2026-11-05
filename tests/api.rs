@@ -412,6 +412,67 @@ async fn apify_runs_pass_the_cost_guard_before_being_queued() {
 }
 
 #[tokio::test]
+async fn the_spending_limits_reported_are_the_limits_enforced() {
+    let app = setup().await;
+
+    // What the operator sets on the Settings page is an override, not advice.
+    let (status, body) = patch(
+        &app,
+        "/api/v1/settings",
+        json!({"budgets": {
+            "kill_switch": true,
+            "apify_daily_budget_eur": 1.5,
+            "apify_max_items_per_run": 5
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Both reporting surfaces must show the ceilings the guard applies, or the panel lies about spending.
+    let (status, usage) = get(&app, "/api/v1/providers/apify/usage").await;
+    assert_eq!(status, StatusCode::OK, "{usage}");
+    assert_eq!(usage["kill_switch"], true, "{usage}");
+    assert_eq!(usage["daily_budget_eur"], 1.5, "{usage}");
+    assert_eq!(usage["max_items_per_run"], 5, "{usage}");
+
+    let (status, dashboard) = get(&app, "/api/v1/dashboard").await;
+    assert_eq!(status, StatusCode::OK, "{dashboard}");
+    assert_eq!(dashboard["apify"]["kill_switch"], true, "{dashboard}");
+    assert_eq!(dashboard["apify"]["daily_budget_eur"], 1.5, "{dashboard}");
+
+    // And the switch that is reported as engaged is the one that refuses the run.
+    let (status, actor) = post(
+        &app,
+        "/api/v1/providers/apify/actors",
+        json!({
+            "actor_id": "operator/supplied-actor",
+            "name": "Operator actor",
+            "source_type": "community_feed",
+            "max_items_per_run": 5
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{actor}");
+    let actor_id = actor["id"].as_str().expect("actor id");
+    let (status, body) = patch(
+        &app,
+        &format!("/api/v1/providers/apify/actors/{actor_id}"),
+        json!({"validation_status": "validated", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = post(
+        &app,
+        "/api/v1/providers/apify/runs",
+        json!({"actor_registry_id": actor_id, "items_limit": 5}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["details"]["reason"], "kill_switch", "{body}");
+}
+
+#[tokio::test]
 async fn communities_and_sources_cannot_be_enabled_without_validation() {
     let app = setup().await;
     let (status, body) = get(&app, "/api/v1/communities?validation_status=pending").await;
