@@ -98,6 +98,9 @@ pub struct LeadRow {
     pub score_category: Option<String>,
     pub qualification_status: String,
     pub review_status: String,
+    /// Set when the operator decided not to answer this lead; `reply_skip_reason` says why.
+    pub reply_skipped_at: Option<String>,
+    pub reply_skip_reason: Option<String>,
     pub is_active: i64,
     pub analysis_count: i64,
     pub comment_count: i64,

@@ -17,6 +17,22 @@ use crate::modules::new_id;
 
 pub const STATES: [&str; 3] = ["waiting", "answered", "closed"];
 
+/// Why a lead was set aside. A fixed list, so the reason is reportable instead of free prose.
+pub const SKIP_REASONS: [&str; 5] = [
+    "not_relevant",
+    "no_product_fit",
+    "community_rules",
+    "already_handled",
+    "other",
+];
+
+pub fn parse_skip_reason(raw: &str) -> Option<&'static str> {
+    let wanted = raw.trim().to_ascii_lowercase();
+    SKIP_REASONS
+        .into_iter()
+        .find(|reason| *reason == wanted.as_str())
+}
+
 pub fn parse_state(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "waiting" => Some("waiting"),
@@ -146,6 +162,71 @@ pub async fn publication_time(
     .fetch_optional(&db.reader)
     .await?;
     Ok(row.map(|(published_at, updated_at)| published_at.unwrap_or(updated_at)))
+}
+
+/// The three queue views as counts, so a tab can print its own number without loading the view.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct QueueCounts {
+    pub to_reply: i64,
+    pub answered: i64,
+    pub skipped: i64,
+}
+
+/// The reply queue's own definition of "open": active, worth answering, never published, never skipped.
+const OPEN_LEAD: &str =
+    "l.is_active = 1 AND l.qualification_status IN ('qualified', 'needs_review')";
+
+pub async fn queue_counts(db: &Db, tenant_id: &str) -> anyhow::Result<QueueCounts> {
+    let published = "EXISTS (SELECT 1 FROM generated_comments c WHERE c.lead_id = l.id \
+                     AND c.status = 'published_manually')";
+    let sql = format!(
+        "SELECT \
+           SUM(CASE WHEN reply_skipped_at IS NULL AND NOT {published} THEN 1 ELSE 0 END) AS to_reply, \
+           SUM(CASE WHEN {published} THEN 1 ELSE 0 END) AS answered, \
+           SUM(CASE WHEN reply_skipped_at IS NOT NULL AND NOT {published} THEN 1 ELSE 0 END) AS skipped \
+         FROM leads l WHERE l.tenant_id = ? AND {OPEN_LEAD}"
+    );
+    let row: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(&sql)
+        .bind(tenant_id)
+        .fetch_one(&db.reader)
+        .await?;
+    Ok(QueueCounts {
+        to_reply: row.0.unwrap_or(0),
+        answered: row.1.unwrap_or(0),
+        skipped: row.2.unwrap_or(0),
+    })
+}
+
+/// Mark a lead as one the operator will not answer, or clear that mark. `None` clears it.
+pub async fn set_skip(
+    db: &Db,
+    tenant_id: &str,
+    lead_id: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<Option<(Option<String>, Option<String>)>> {
+    let now = now_iso();
+    let updated = sqlx::query(
+        "UPDATE leads SET reply_skipped_at = ?, reply_skip_reason = ?, updated_at = ? \
+         WHERE id = ? AND tenant_id = ?",
+    )
+    .bind(reason.map(|_| now.clone()))
+    .bind(reason)
+    .bind(&now)
+    .bind(lead_id)
+    .bind(tenant_id)
+    .execute(&db.writer)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let row: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT reply_skipped_at, reply_skip_reason FROM leads WHERE id = ? AND tenant_id = ?",
+    )
+    .bind(lead_id)
+    .bind(tenant_id)
+    .fetch_one(&db.reader)
+    .await?;
+    Ok(Some(row))
 }
 
 pub async fn counts(db: &Db, tenant_id: &str) -> anyhow::Result<i64> {

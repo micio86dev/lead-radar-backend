@@ -57,6 +57,10 @@ pub fn router(state: SharedState) -> Router {
             post(opportunities::record_reply),
         )
         .route(
+            "/opportunities/{id}/reply-skip",
+            post(opportunities::reply_skip),
+        )
+        .route(
             "/opportunities/{id}",
             get(opportunities::detail).delete(opportunities::remove),
         )

@@ -45,6 +45,8 @@ pub fn lead_list_json(
         "score_category": row.score_category,
         "qualification_status": row.qualification_status,
         "review_status": row.review_status,
+        "reply_skipped_at": row.reply_skipped_at,
+        "reply_skip_reason": row.reply_skip_reason,
         "confidence": row.confidence,
         "evidence_count": evidence_count,
         "comment_count": comment_count,
@@ -305,10 +307,49 @@ where
 pub struct ConsoleQuery {
     #[serde(default)]
     pub limit: Option<i64>,
-    /// Include the leads whose reply was already recorded as published. Off by default so the queue
-    /// never re-offers work that is done. Accepts `1`/`true` because both the page and curl use it.
+    /// Which queue to read: `to_reply` (default), `ignored`, `answered` or `all`. The views are
+    /// disjoint, so a published lead is answered and never also listed as ignored.
+    #[serde(default)]
+    pub view: Option<String>,
+    /// Kept for the Chrome extension and old links: it means `view=all`. Accepts `1`/`true`.
     #[serde(default, deserialize_with = "de_flag")]
     pub include_answered: bool,
+}
+
+/// The reply queue's views. Parsing is explicit so an unknown value is a 400 instead of a silent default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleView {
+    ToReply,
+    Ignored,
+    Answered,
+    All,
+}
+
+impl ConsoleView {
+    pub fn parse(raw: Option<&str>, include_answered: bool) -> AppResult<Self> {
+        if include_answered {
+            return Ok(Self::All);
+        }
+        match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Ok(Self::ToReply),
+            Some("to_reply") => Ok(Self::ToReply),
+            Some("ignored") => Ok(Self::Ignored),
+            Some("answered") => Ok(Self::Answered),
+            Some("all") => Ok(Self::All),
+            Some(other) => Err(AppError::BadRequest(format!(
+                "view has an unknown value {other:?}: use to_reply, ignored, answered or all"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToReply => "to_reply",
+            Self::Ignored => "ignored",
+            Self::Answered => "answered",
+            Self::All => "all",
+        }
+    }
 }
 
 #[utoipa::path(get, path = "/api/v1/reply-console", tag = "opportunities", responses((status = 200, description = "Compact reply queue")))]
@@ -319,26 +360,32 @@ pub async fn reply_console(
 ) -> AppResult<Json<serde_json::Value>> {
     let tenant = &context.tenant_id;
     let limit = query.limit.unwrap_or(25).clamp(1, 50);
-    let sql = if query.include_answered {
-        "SELECT l.*, s.name AS source_name, \
-         (SELECT COUNT(*) FROM generated_comments c WHERE c.lead_id = l.id) AS comment_count \
-         FROM leads l LEFT JOIN sources s ON s.id = l.source_id \
-         WHERE l.tenant_id = ? AND l.is_active = 1 \
-         AND l.qualification_status IN ('qualified', 'needs_review') \
-         ORDER BY CASE l.qualification_status WHEN 'qualified' THEN 0 ELSE 1 END, \
-         l.score DESC, l.created_at DESC LIMIT ?"
-    } else {
-        "SELECT l.*, s.name AS source_name, \
-         (SELECT COUNT(*) FROM generated_comments c WHERE c.lead_id = l.id) AS comment_count \
-         FROM leads l LEFT JOIN sources s ON s.id = l.source_id \
-         WHERE l.tenant_id = ? AND l.is_active = 1 \
-         AND l.qualification_status IN ('qualified', 'needs_review') \
-         AND NOT EXISTS (SELECT 1 FROM generated_comments c WHERE c.lead_id = l.id \
-           AND c.status = 'published_manually') \
-         ORDER BY CASE l.qualification_status WHEN 'qualified' THEN 0 ELSE 1 END, \
-         l.score DESC, l.created_at DESC LIMIT ?"
+    let view = ConsoleView::parse(query.view.as_deref(), query.include_answered)?;
+    // Published and skipped leads are different states, and each view sees exactly one of them.
+    let published = "EXISTS (SELECT 1 FROM generated_comments c WHERE c.lead_id = l.id \
+                     AND c.status = 'published_manually')";
+    let filter = match view {
+        ConsoleView::ToReply => format!("AND l.reply_skipped_at IS NULL AND NOT {published}"),
+        ConsoleView::Ignored => format!("AND l.reply_skipped_at IS NOT NULL AND NOT {published}"),
+        ConsoleView::Answered => format!("AND {published}"),
+        ConsoleView::All => String::new(),
     };
-    let rows = sqlx::query_as::<_, qualification::LeadRow>(sql)
+    let order = match view {
+        ConsoleView::Ignored => "l.reply_skipped_at DESC, l.score DESC",
+        _ => {
+            "CASE l.qualification_status WHEN 'qualified' THEN 0 ELSE 1 END, l.score DESC, \
+              l.created_at DESC"
+        }
+    };
+    let sql = format!(
+        "SELECT l.*, s.name AS source_name, \
+         (SELECT COUNT(*) FROM generated_comments c WHERE c.lead_id = l.id) AS comment_count \
+         FROM leads l LEFT JOIN sources s ON s.id = l.source_id \
+         WHERE l.tenant_id = ? AND l.is_active = 1 \
+         AND l.qualification_status IN ('qualified', 'needs_review') {filter} \
+         ORDER BY {order} LIMIT ?"
+    );
+    let rows = sqlx::query_as::<_, qualification::LeadRow>(&sql)
         .bind(tenant)
         .bind(limit)
         .fetch_all(&state.db.reader)
@@ -384,13 +431,17 @@ pub async fn reply_console(
         .map(|next| (next - chrono::Utc::now()).num_seconds().max(0))
         .unwrap_or(0);
 
+    let counts = replies::queue_counts(&state.db, tenant).await?;
     Ok(Json(json!({
         "items": items,
+        "view": view.as_str(),
         "stats": {
             "ready": ready,
             "needs_drafts": needs_drafts,
             "returned": rows.len(),
-            "answered": replies::counts(&state.db, tenant).await?,
+            "to_reply": counts.to_reply,
+            "skipped": counts.skipped,
+            "answered": counts.answered,
         },
         "pacing": {
             "next_reply_at": pacing.next_reply_at,
@@ -607,6 +658,86 @@ pub struct ReplyBody {
     pub body: Option<String>,
     pub engagement_kind: Option<String>,
     pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SkipBody {
+    /// `true` marks the lead as one the operator will not answer; `false` undoes it.
+    pub skipped: bool,
+    /// Required when `skipped` is true, ignored when it is false.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/opportunities/{id}/reply-skip", tag = "opportunities", responses((status = 200, description = "Lead marked as not replying, or the mark removed"), (status = 409, description = "The reply was already recorded"), (status = 422, description = "Unknown reason")))]
+pub async fn reply_skip(
+    State(state): State<SharedState>,
+    context: TenantContext,
+    Path(id): Path<String>,
+    Json(body): Json<SkipBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    let tenant = &context.tenant_id;
+    context.require_reviewer()?;
+    let lead = qualification::get_lead(&state.db, tenant, &id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    let reason = if body.skipped {
+        let raw = body.reason.as_deref().map(str::trim).unwrap_or_default();
+        if raw.is_empty() {
+            return Err(AppError::Validation(vec![crate::error::FieldError::new(
+                "reason",
+                format!(
+                    "required when skipping: one of {}",
+                    replies::SKIP_REASONS.join(", ")
+                ),
+            )]));
+        }
+        Some(replies::parse_skip_reason(raw).ok_or_else(|| {
+            AppError::Validation(vec![crate::error::FieldError::new(
+                "reason",
+                format!("must be one of {}", replies::SKIP_REASONS.join(", ")),
+            )])
+        })?)
+    } else {
+        None
+    };
+
+    // A recorded publication is the stronger statement: the lead is answered, not set aside.
+    if reason.is_some()
+        && replies::publication_time(&state.db, tenant, &lead.id)
+            .await?
+            .is_some()
+    {
+        return Err(AppError::Conflict(
+            "lead_already_answered: this lead already has a recorded reply".to_string(),
+        ));
+    }
+
+    let (skipped_at, skip_reason) = replies::set_skip(&state.db, tenant, &lead.id, reason)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    operations::audit(
+        &state.db,
+        tenant,
+        &context.actor,
+        if reason.is_some() {
+            "lead_reply_skipped"
+        } else {
+            "lead_reply_unskipped"
+        },
+        "lead",
+        Some(&lead.id),
+        &json!({"reason": skip_reason}),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "lead_id": lead.id,
+        "reply_skipped_at": skipped_at,
+        "reply_skip_reason": skip_reason,
+    })))
 }
 
 #[utoipa::path(post, path = "/api/v1/opportunities/{id}/reply", tag = "opportunities", responses((status = 200, description = "Reply recorded as manually posted"), (status = 409, description = "Draft missing or already used")))]

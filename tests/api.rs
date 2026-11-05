@@ -1543,6 +1543,110 @@ async fn content_removal_hides_the_opportunity_and_keeps_an_audit_trail() {
 }
 
 #[tokio::test]
+async fn a_lead_can_be_set_aside_and_brought_back() {
+    let app = setup().await;
+    let lead_id = import_and_lead(&app).await;
+
+    // It starts in the queue.
+    let (status, body) = get(&app, "/api/v1/reply-console?limit=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().expect("items").len(), 1, "{body}");
+    assert_eq!(body["stats"]["to_reply"], 1, "{body}");
+    assert_eq!(body["view"], "to_reply", "{body}");
+
+    // Setting it aside needs a reason from the fixed list.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply-skip"),
+        json!({"skipped": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply-skip"),
+        json!({"skipped": true, "reason": "because I said so"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply-skip"),
+        json!({"skipped": true, "reason": "not_relevant"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reply_skip_reason"], "not_relevant", "{body}");
+    assert!(
+        body["reply_skipped_at"].as_str().is_some(),
+        "the date is what the ignored view shows: {body}"
+    );
+
+    // Out of the working queue, in the ignored view, and the tab counts follow.
+    let (_, body) = get(&app, "/api/v1/reply-console?limit=10").await;
+    assert_eq!(body["items"].as_array().expect("items").len(), 0, "{body}");
+    assert_eq!(body["stats"]["to_reply"], 0, "{body}");
+    assert_eq!(body["stats"]["skipped"], 1, "{body}");
+
+    let (status, body) = get(&app, "/api/v1/reply-console?limit=10&view=ignored").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().expect("items").len(), 1, "{body}");
+    assert_eq!(
+        body["items"][0]["lead"]["reply_skip_reason"], "not_relevant",
+        "{body}"
+    );
+
+    // A view nobody defined is a client error, never a silent default.
+    let (status, body) = get(&app, "/api/v1/reply-console?view=maybe").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Undo returns it to the same queue it left.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply-skip"),
+        json!({"skipped": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["reply_skipped_at"].is_null(), "{body}");
+    let (_, body) = get(&app, "/api/v1/reply-console?limit=10").await;
+    assert_eq!(body["items"].as_array().expect("items").len(), 1, "{body}");
+    assert_eq!(body["stats"]["skipped"], 0, "{body}");
+}
+
+#[tokio::test]
+async fn an_answered_lead_cannot_be_set_aside() {
+    let app = setup().await;
+    let lead_id = import_and_lead(&app).await;
+    post(&app, "/api/v1/reply-console/prepare", json!({"limit": 1})).await;
+    lead_radar::worker::drain(&app.state, 20)
+        .await
+        .expect("drain");
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply"),
+        json!({"variant": "helpful", "note": "answered in the thread"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A recorded publication is the stronger statement, and the answered view owns the lead.
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/opportunities/{lead_id}/reply-skip"),
+        json!({"skipped": true, "reason": "already_handled"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "conflict", "{body}");
+    let (_, body) = get(&app, "/api/v1/reply-console?view=ignored").await;
+    assert_eq!(body["items"].as_array().expect("items").len(), 0, "{body}");
+    let (_, body) = get(&app, "/api/v1/reply-console?view=answered").await;
+    assert_eq!(body["items"].as_array().expect("items").len(), 1, "{body}");
+}
+
+#[tokio::test]
 async fn verticals_are_seeded_and_validated_on_input() {
     let app = setup().await;
     assert_eq!(Vertical::ALL.len(), 6);
